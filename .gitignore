@@ -1,0 +1,17 @@
+# 构建中间产物
+ui-v2/obj/
+ui-v2/build/
+ui-v2/build_cs5/
+bin/
+obj/
+
+# 运行期产物（日志 / 导出）
+*.log
+ALPA_Log.txt
+ALPA_v2_Log_*.txt
+ALPA_v2_Drivers_Report.csv
+ALPA_v2_Spikes.csv
+ALPA_Drivers_Report.csv
+
+# 开发期截图（正式截图在 screenshots/）
+shots/

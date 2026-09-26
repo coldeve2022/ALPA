@@ -1,0 +1,768 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
+using System.Windows.Forms;
+
+namespace ALP2
+{
+    internal abstract class PageBase : Panel
+    {
+        protected readonly Engine Eng;
+
+        protected PageBase(Engine e)
+        {
+            Eng = e;
+            DoubleBuffered = true;
+            BackColor = Theme.Cur.Bg;
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
+        }
+
+        public abstract string NavLabel { get; }
+        public abstract Icon NavIcon { get; }
+
+        protected string HeadTitle = "";
+        protected string HeadSub = "";
+        protected string HeadRight = "";
+
+        protected int Pad { get { return Theme.Px(14); } }
+        protected int Gap { get { return Theme.Px(12); } }
+        /// <summary>正文区起点。跟随 PageHead 的实测高度走，避免标题副标题被工具栏压住。</summary>
+        protected int ContentTop { get { return PageHead.Height + Theme.Px(1); } }
+
+        public virtual void OnSample(Snapshot s) { }
+        public virtual void ApplyTheme() { Invalidate(); }
+
+        protected abstract void DoLayout();
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (Width > Theme.Px(60) && Height > Theme.Px(60)) DoLayout();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Theme.Cur.Bg);
+            PageHead.Paint(e.Graphics, HeadTitle, HeadSub, Pad, Theme.Px(4), Width - Pad * 2, HeadRight);
+        }
+    }
+
+    /// <summary>两列「标签：数值」小卡，用于概览页底部。</summary>
+    internal class MiniStats : SkinnedControl
+    {
+        public class KV
+        {
+            public string K = "";
+            public string V = "";
+            public Sev Sev = Sev.Neutral;
+        }
+
+        private List<KV> _rows = new List<KV>();
+        private string _empty = "等待数据…";
+
+        public MiniStats() { Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } }; }
+
+        public void Set(List<KV> rows)
+        {
+            _rows = rows != null ? rows : new List<KV>();
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Palette p = Theme.Cur;
+            g.Clear(p.Surface);
+            if (_rows.Count == 0)
+            {
+                Draw.Text(g, _empty, Theme.F(8.8f, FontStyle.Regular), p.TextMuted, ClientRectangle,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                return;
+            }
+
+            Font fk = Theme.F(8.6f, FontStyle.Regular);
+            Font fv = Theme.Fm(8.8f, FontStyle.Bold);
+            int fkH = Draw.LineH(fk);
+            int fvH = Draw.LineH(fv);
+            int gapx = Theme.Px(10);
+
+            // 先量最大宽度：卡片窄的时候不能硬塞「左标签 + 右数值」，否则数值会被截成 "0…"
+            int widestK = 0, widestV = 0;
+            foreach (KV kv in _rows)
+            {
+                int w1 = Draw.Measure(kv.K, fk).Width;
+                int w2 = Draw.Measure(kv.V, fv).Width;
+                if (w1 > widestK) widestK = w1;
+                if (w2 > widestV) widestV = w2;
+            }
+            bool stacked = widestK + widestV + gapx > Width;
+
+            int y = Theme.Px(1);
+            if (!stacked)
+            {
+                int rh = Math.Min(Theme.Px(26), Math.Max(Theme.Px(17), (Height - Theme.Px(2)) / Math.Max(1, _rows.Count)));
+                rh = Math.Max(rh, fkH);
+                int labelW = Math.Min(widestK + Theme.Px(3), Math.Max(Theme.Px(40), Width - widestV - gapx));
+                foreach (KV kv in _rows)
+                {
+                    if (y + rh > Height) break;
+                    Draw.Text(g, kv.K, fk, p.TextSec, new Rectangle(0, y, labelW, rh),
+                        TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                    Draw.Text(g, kv.V, fv, Theme.SevColor(kv.Sev), new Rectangle(labelW, y, Math.Max(1, Width - labelW), rh),
+                        TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                    y += rh;
+                }
+            }
+            else
+            {
+                // 纵向两行：标签在上、数值在下，窄卡片下每个字都看得全
+                int rowH = fkH + fvH + Theme.Px(3);
+                foreach (KV kv in _rows)
+                {
+                    if (y + rowH > Height + Theme.Px(2)) break;
+                    Draw.Text(g, kv.K, fk, p.TextSec, new Rectangle(0, y, Width, fkH),
+                        TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                    Draw.Text(g, kv.V, fv, Theme.SevColor(kv.Sev), new Rectangle(0, y + fkH + Theme.Px(1), Width, fvH),
+                        TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                    y += rowH;
+                }
+            }
+        }
+    }
+
+    /// <summary>紧凑的尖峰流水（时间 / 驱动 / 时长）。</summary>
+    internal class SpikeFeed : SkinnedControl
+    {
+        private List<SpikeRec> _items = new List<SpikeRec>();
+        private string _empty = "还没有超过阈值的尖峰";
+
+        public SpikeFeed() { Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } }; }
+
+        public void Set(List<SpikeRec> items, string empty)
+        {
+            _items = items != null ? items : new List<SpikeRec>();
+            if (empty != null) _empty = empty;
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Palette p = Theme.Cur;
+            g.Clear(p.Surface);
+            if (_items.Count == 0)
+            {
+                Draw.Text(g, _empty, Theme.F(8.8f, FontStyle.Regular), p.TextMuted, ClientRectangle,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                return;
+            }
+            Font ft = Theme.Fm(8.2f, FontStyle.Regular);
+            Font fn = Theme.F(8.6f, FontStyle.Regular);
+            Font fv = Theme.Fm(8.6f, FontStyle.Bold);
+            int rh = Theme.Px(21);
+            int y = Theme.Px(1);
+            int timeW = Theme.Px(58);
+            int valW = Theme.Px(67);
+            for (int i = _items.Count - 1; i >= 0; i--)
+            {
+                if (y + rh > Height) break;
+                SpikeRec r = _items[i];
+                Sev sv = Engine.GradeFor(r.Type, r.Us);
+                Draw.Text(g, r.T.ToString("HH:mm:ss"), ft, p.TextMuted, new Rectangle(0, y, timeW, rh),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                Draw.Text(g, r.Driver, fn, p.TextPri, new Rectangle(timeW, y, Math.Max(Theme.Px(30), Width - timeW - valW), rh),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                Draw.Text(g, Fmt.Us(r.Us) + " µs", fv, Theme.SevColor(sv), new Rectangle(Width - valW, y, valW, rh),
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                y += rh;
+            }
+        }
+    }
+
+    /// <summary>选中驱动的详情：P50/P95/P99/Max 的分布形态一眼可见（长尾还是整体偏高）。</summary>
+    internal class DriverDetail : SkinnedControl
+    {
+        private DriverStat _st;
+        private string _empty = "在上方表格里点一行驱动，这里显示它的延迟分布";
+
+        public DriverDetail() { Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } }; }
+
+        public void Set(DriverStat st)
+        {
+            _st = st;
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Palette p = Theme.Cur;
+            g.Clear(p.Surface);
+
+            if (_st == null)
+            {
+                Draw.Text(g, _empty, Theme.F(8.8f, FontStyle.Regular), p.TextMuted, ClientRectangle,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
+                return;
+            }
+
+            bool isr = string.Equals(_st.Type, "ISR", StringComparison.OrdinalIgnoreCase);
+            Sev worst = Engine.GradeFor(_st.Type, _st.Max);
+
+            Font fn = Theme.F(10.5f, FontStyle.Bold);
+            Font ft = Theme.F(8.6f, FontStyle.Regular);
+            Font fk = Theme.F(8.4f, FontStyle.Regular);
+            Font fv = Theme.Fm(8.8f, FontStyle.Bold);
+            Font fb = Theme.F(7.6f, FontStyle.Bold);
+
+            int y = Theme.Px(2);
+            Draw.Text(g, _st.Name, fn, p.TextPri, new Rectangle(0, y, Width - Theme.Px(66), fn.Height),
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+
+            string badge = _st.Type + (isr ? "  阈值 500µs" : "  阈值 1000µs");
+            Size bs = Draw.Measure(badge, fb);
+            Rectangle br = new Rectangle(Width - bs.Width - Theme.Px(14), y + Theme.Px(1), bs.Width + Theme.Px(12), Theme.Px(17));
+            Draw.FillRound(g, br, Theme.Px(8), Theme.SevSoft(worst), null);
+            Draw.Text(g, badge, fb, Theme.SevColor(worst), br,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            y += fn.Height + Theme.Px(2);
+
+            Draw.Text(g, "采集 " + Fmt.Count(_st.Count) + " 次 · 当前 " + Fmt.Us(_st.Cur) + " µs · 平均 " + Fmt.Us(_st.Avg) + " µs", ft, p.TextSec,
+                new Rectangle(0, y, Width, ft.Height), TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            y += ft.Height + Theme.Px(8);
+
+            // 四根相对长度的条：p50/p95/p99/max，直观区分「整体慢」和「偶尔抖」
+            double[] vals = { _st.P50, _st.P95, _st.P99, _st.Max };
+            string[] names = { "P50 中位", "P95", "P99", "Max 峰值" };
+            double top = _st.Max > 0 ? _st.Max : 1;
+            int labelW = Theme.Px(60);
+            int valW = Theme.Px(72);
+            int barX = labelW;
+            int barW = Math.Max(Theme.Px(30), Width - labelW - valW - Theme.Px(6));
+            for (int i = 0; i < 4; i++)
+            {
+                int rh = Theme.Px(22);
+                Sev sv = Engine.GradeFor(_st.Type, vals[i]);
+                Draw.Text(g, names[i], fk, p.TextSec, new Rectangle(0, y, labelW, rh),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                int bh = Theme.Px(8);
+                int by = y + (rh - bh) / 2;
+                Draw.FillRound(g, new Rectangle(barX, by, barW, bh), bh / 2, p.SurfaceAlt, null);
+                int fw = (int)Math.Round(barW * Math.Max(0.015, Math.Min(1.0, vals[i] / top)));
+                Draw.FillRound(g, new Rectangle(barX, by, Math.Max(bh, fw), bh), bh / 2, Theme.SevColor(sv), null);
+                Draw.Text(g, Fmt.Us(vals[i]) + " µs", fv, Theme.SevColor(sv), new Rectangle(Width - valW, y, valW, rh),
+                    TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                y += rh;
+            }
+
+            y += Theme.Px(4);
+            string verdict;
+            if (worst == Sev.Crit) verdict = "该驱动已产生超过阈值的延迟 —— 优先排查它的驱动版本 / 电源管理设置";
+            else if (worst == Sev.Warn) verdict = "接近但未超过阈值，属于「需要注意」区间";
+            else verdict = "延迟表现正常，不构成掉帧来源";
+            Draw.Text(g, verdict, Theme.F(8f, FontStyle.Regular), Theme.SevColor(worst),
+                new Rectangle(0, y, Width, Height - y),
+                TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
+        }
+    }
+
+    /// <summary>多段说明文字（自动换行）。</summary>
+    internal class TextBlock : SkinnedControl
+    {
+        public string[] Lines = new string[0];
+        public string Heading = "";
+
+        public TextBlock() { Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } }; }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Palette p = Theme.Cur;
+            g.Clear(p.Surface);
+            int y = Theme.Px(2);
+            if (!string.IsNullOrEmpty(Heading))
+            {
+                Font fh = Theme.F(9.2f, FontStyle.Bold);
+                Draw.Text(g, Heading, fh, p.TextPri, new Rectangle(0, y, Width, fh.Height),
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                y += fh.Height + Theme.Px(6);
+            }
+            Font f = Theme.F(8.5f, FontStyle.Regular);
+            foreach (string line in Lines)
+            {
+                Size sz = TextRenderer.MeasureText(g, line, f, new Size(Width, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix);
+                if (y + sz.Height > Height) break;
+                Draw.Text(g, line, f, p.TextSec, new Rectangle(0, y, Width, sz.Height),
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.WordBreak);
+                y += sz.Height + Theme.Px(5);
+            }
+        }
+    }
+
+    // =========================================================================================
+    //  概览
+    // =========================================================================================
+    internal class OverviewPage : PageBase
+    {
+        private readonly StatCard[] _stat = new StatCard[5];
+        private readonly Card _cardChart = new Card();
+        private readonly Card _cardTop = new Card();
+        private readonly Card _cardSpike = new Card();
+        private readonly Card[] _cardBot = new Card[4];
+        private readonly TimelineChart _chart = new TimelineChart();
+        private readonly BarList _top = new BarList();
+        private readonly SpikeFeed _feed = new SpikeFeed();
+        private readonly MiniStats[] _mini = new MiniStats[4];
+
+        public OverviewPage(Engine e)
+            : base(e)
+        {
+            HeadTitle = "概览";
+            HeadSub = "延迟、抖动与系统负载的总览。左侧曲线是判断「抖动是否频繁」的核心视图。";
+
+            for (int i = 0; i < _stat.Length; i++)
+            {
+                _stat[i] = new StatCard();
+                Controls.Add(_stat[i]);
+            }
+
+            _cardChart.Title = "DPC / ISR 延迟时间线";
+            _cardChart.Subtitle = "每秒取该秒内的最大与平均延迟；红点 = 超过危险线";
+            _cardChart.TitleIcon = Icon.Pulse;
+            _cardChart.Controls.Add(_chart);
+            Controls.Add(_cardChart);
+
+            _cardSpike.Title = "最近尖峰";
+            _cardSpike.Subtitle = "超过阈值的事件，最新在最上";
+            _cardSpike.TitleIcon = Icon.Warn;
+            _cardSpike.Controls.Add(_feed);
+            Controls.Add(_cardSpike);
+
+            _cardTop.Title = "延迟最高的驱动";
+            _cardTop.Subtitle = "按峰值排序，条形长度 = 相对最高值";
+            _cardTop.TitleIcon = Icon.Layers;
+            _cardTop.Controls.Add(_top);
+            Controls.Add(_cardTop);
+
+            string[] titles = { "磁盘活动", "内存与页面", "网络与中断", "输入与定时器" };
+            Icon[] icons = { Icon.Layers, Icon.Gauge, Icon.Pulse, Icon.Grid };
+            for (int i = 0; i < 4; i++)
+            {
+                _cardBot[i] = new Card();
+                _cardBot[i].Title = titles[i];
+                _cardBot[i].TitleIcon = icons[i];
+                _mini[i] = new MiniStats();
+                _cardBot[i].Controls.Add(_mini[i]);
+                Controls.Add(_cardBot[i]);
+            }
+        }
+
+        public override string NavLabel { get { return "概览"; } }
+        public override Icon NavIcon { get { return Icon.Grid; } }
+
+        protected override void DoLayout()
+        {
+            int x0 = Pad, w = Width - Pad * 2;
+            if (w < Theme.Px(200)) return;
+            int y = ContentTop;
+
+            int statH = Theme.Px(104);
+            int n = _stat.Length;
+            int cardW = (w - Gap * (n - 1)) / n;
+            for (int i = 0; i < n; i++)
+                _stat[i].SetBounds(x0 + i * (cardW + Gap), y, cardW, statH);
+            y += statH + Gap;
+
+            int bottomH = Theme.Px(144);
+            int rightW = Math.Min(Theme.Px(372), Math.Max(Theme.Px(286), w / 3));
+            int leftW = w - rightW - Gap;
+            int midH = Height - y - bottomH - Gap - Theme.Px(8);
+            if (midH < Theme.Px(170)) midH = Theme.Px(170);
+
+            int spikeH = Math.Max(Theme.Px(110), midH * 38 / 100);
+            _cardSpike.SetBounds(x0 + leftW + Gap, y, rightW, spikeH);
+            _cardTop.SetBounds(x0 + leftW + Gap, y + spikeH + Gap, rightW, midH - spikeH - Gap);
+            _cardChart.SetBounds(x0, y, leftW, midH);
+            y += midH + Gap;
+
+            int bn = 4;
+            int bw = (w - Gap * (bn - 1)) / bn;
+            for (int i = 0; i < bn; i++)
+                _cardBot[i].SetBounds(x0 + i * (bw + Gap), y, bw, bottomH);
+
+            LayoutCardInner();
+        }
+
+        private void LayoutCardInner()
+        {
+            Inset(_cardChart, _chart);
+            Inset(_cardSpike, _feed);
+            Inset(_cardTop, _top);
+            for (int i = 0; i < 4; i++) Inset(_cardBot[i], _mini[i]);
+        }
+
+        private static void Inset(Card c, Control inner)
+        {
+            int top = c.HeaderHeight;
+            int pad = Theme.Px(12);
+            inner.SetBounds(pad, top, Math.Max(Theme.Px(20), c.Width - pad * 2), Math.Max(Theme.Px(20), c.Height - top - pad + Theme.Px(4)));
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            LayoutCardInner();
+        }
+
+        public override void ApplyTheme()
+        {
+            base.ApplyTheme();
+            BackColor = Theme.Cur.Bg;
+        }
+
+        public override void OnSample(Snapshot s)
+        {
+            Sev dsev = Engine.GradeDpc(s.MaxDpc);
+            _stat[0].Set("最高 DPC", Fmt.Us(s.MaxDpc), "µs",
+                string.IsNullOrEmpty(s.WorstDriver) ? "尚未捕获 DPC 事件" : "来自 " + s.WorstDriver, dsev);
+
+            string worstIsr = "";
+            double maxIsr = 0;
+            foreach (DriverStat d in s.Isr) { if (d.Max > maxIsr) { maxIsr = d.Max; worstIsr = d.Name; } }
+            _stat[1].Set("最高 ISR", Fmt.Us(maxIsr), "µs",
+                string.IsNullOrEmpty(worstIsr) ? "尚未捕获 ISR 事件" : "来自 " + worstIsr, Engine.GradeIsr(maxIsr));
+
+            _stat[2].Set("DPC 速率", Fmt.Count((long)s.DpcPerSec), "/s",
+                "ISR " + Fmt.Count((long)s.IsrPerSec) + "/s", Sev.Info);
+
+            _stat[3].Set("定时器精度", s.TimerMs.ToString("0.0000", CultureInfo.InvariantCulture), "ms",
+                "鼠标回报率 " + (s.MouseHz > 1 ? s.MouseHz.ToString("0") + " Hz" : "未检测到移动"),
+                s.TimerMs <= 1.0 ? Sev.Ok : (s.TimerMs <= 2.0 ? Sev.Info : Sev.Warn));
+
+            _stat[4].Set("尖峰计数", s.SpikeCount.ToString("#,0"), "次",
+                "阈值 DPC ≥ " + Eng.DpcThreshold.ToString("0") + "µs",
+                s.SpikeCount == 0 ? Sev.Ok : Sev.Warn);
+
+            _chart.Push(s.MaxDpc, s.AvgDpc, s.MaxIsr, s.SpikeCount > 0 ? 1 : 0);
+            _chart.WarnUs = Eng.DpcThreshold;
+            _chart.CritUs = Eng.DpcThreshold * 2;
+
+            List<SpikeRec> sp = Eng.Spikes;
+            List<SpikeRec> tail = new List<SpikeRec>();
+            int take = Math.Min(40, sp.Count);
+            for (int i = sp.Count - take; i < sp.Count; i++) tail.Add(sp[i]);
+            _feed.Set(tail, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+
+            BuildTop(s);
+            BuildMini(s);
+        }
+
+        private void BuildTop(Snapshot s)
+        {
+            List<BarList.Item> items = new List<BarList.Item>();
+            List<DriverStat> all = new List<DriverStat>();
+            all.AddRange(s.Dpc);
+            all.AddRange(s.Isr);
+            // 峰值排行，但把只跑过一两次的细节过滤掉，否则全是噪声条目
+            List<DriverStat> filt = new List<DriverStat>();
+            foreach (DriverStat d in all) if (d.Count >= 3 && d.Max > 0) filt.Add(d);
+            filt.Sort(delegate (DriverStat a, DriverStat b) { return b.Max.CompareTo(a.Max); });
+
+            double top = filt.Count > 0 ? filt[0].Max : 1;
+            for (int i = 0; i < Math.Min(7, filt.Count); i++)
+            {
+                DriverStat d = filt[i];
+                BarList.Item it = new BarList.Item();
+                it.Label = d.Name;
+                it.Value = Fmt.Us(d.Max) + " µs";
+                it.Sub = d.Type + " · P99 " + Fmt.Us(d.P99) + " · " + Fmt.Count(d.Count) + " 次";
+                it.Fraction = d.Max / top;
+                it.Sev = Engine.GradeFor(d.Type, d.Max);
+                items.Add(it);
+            }
+            _top.Set(items, s.Tracing ? "还没有累积到足够的 DPC/ISR 事件" : "未启用内核追踪");
+        }
+
+        private void BuildMini(Snapshot s)
+        {
+            List<MiniStats.KV> d = new List<MiniStats.KV>();
+            int dn = Math.Min(4, s.Disks.Count);
+            for (int i = 0; i < dn; i++)
+            {
+                DiskRow r = s.Disks[i];
+                MiniStats.KV kv = new MiniStats.KV();
+                kv.K = r.Name;
+                kv.V = r.LatencyMs.ToString("0.0") + "ms · " + r.ActivePct.ToString("0") + "%";
+                kv.Sev = r.LatencyMs > 20 ? Sev.Warn : Sev.Ok;
+                d.Add(kv);
+            }
+            _mini[0].Set(d);
+
+            List<MiniStats.KV> m = new List<MiniStats.KV>();
+            AddKV(m, "可用内存", Fmt.Mb(s.AvailMb), s.AvailMb < 1024 ? Sev.Crit : (s.AvailMb < 2048 ? Sev.Warn : Sev.Ok));
+            AddKV(m, "待机缓存", Fmt.Mb(s.CacheMb), Sev.Neutral);
+            AddKV(m, "缺页次数/秒", Fmt.Count((long)s.PageFaults), s.PageFaults > 5000 ? Sev.Warn : Sev.Ok);
+            AddKV(m, "处理器队列", s.ProcQueue.ToString("0.0"), s.ProcQueue > 2 ? Sev.Warn : Sev.Ok);
+            _mini[1].Set(m);
+
+            List<MiniStats.KV> nw = new List<MiniStats.KV>();
+            AddKV(nw, "网络吞吐", s.NetMbs.ToString("0.00") + " MB/s", s.NetMbs > 1 ? Sev.Info : Sev.Neutral);
+            AddKV(nw, "中断/秒", Fmt.Count((long)s.InterruptsTotal), SeverityOfCores(s.CoreInterrupts));
+            AddKV(nw, "上下文切换/秒", Fmt.Count((long)s.ContextSw), Sev.Neutral);
+            AddKV(nw, "UDP 收包错误", s.UdpErr.ToString("0"), s.UdpErr > 0 ? Sev.Warn : Sev.Ok);
+            _mini[2].Set(nw);
+
+            List<MiniStats.KV> io = new List<MiniStats.KV>();
+            AddKV(io, "定时器精度", s.TimerMs.ToString("0.000") + " ms", s.TimerMs <= 1 ? Sev.Ok : Sev.Info);
+            AddKV(io, "鼠标回报率", s.MouseHz > 1 ? s.MouseHz.ToString("0") + " Hz" : "—", Sev.Neutral);
+            AddKV(io, "DPC 事件/秒", Fmt.Count((long)s.DpcPerSec), Sev.Neutral);
+            AddKV(io, "内核追踪", s.Tracing ? "运行中" : "已停止", s.Tracing ? Sev.Ok : Sev.Warn);
+            _mini[3].Set(io);
+        }
+
+        private static Sev SeverityOfCores(float[] cores)
+        {
+            float max = 0;
+            for (int i = 0; i < cores.Length; i++) if (cores[i] > max) max = cores[i];
+            if (max > 20000) return Sev.Crit;
+            if (max > 15000) return Sev.Warn;
+            return Sev.Ok;
+        }
+
+        private static void AddKV(List<MiniStats.KV> list, string k, string v, Sev sev)
+        {
+            MiniStats.KV kv = new MiniStats.KV();
+            kv.K = k; kv.V = v; kv.Sev = sev;
+            list.Add(kv);
+        }
+    }
+
+    // =========================================================================================
+    //  DPC / ISR
+    // =========================================================================================
+    internal class DpcPage : PageBase
+    {
+        private readonly SearchBox _search = new SearchBox();
+        private readonly Segmented _typeSeg;
+        private readonly FlatButton _btnReset = new FlatButton();
+        private readonly FlatButton _btnExport = new FlatButton();
+        private readonly Card _cardTable = new Card();
+        private readonly Card _cardDetail = new Card();
+        private readonly Card _cardSpikes = new Card();
+        private readonly TableView _table = new TableView();
+        private readonly DriverDetail _detail = new DriverDetail();
+        private readonly SpikeFeed _feed = new SpikeFeed();
+        private readonly FlatButton _btnExportSpikes = new FlatButton();
+
+        private int _typeFilter;   // 0 全部 1 DPC 2 ISR
+
+        public DpcPage(Engine e)
+            : base(e)
+        {
+            HeadTitle = "DPC / ISR 延迟";
+            HeadSub = "内核态中断处理耗时。P99 才是判断「抖不抖」的关键，Max 只代表最极端的一次。";
+
+            _search.Placeholder = "按驱动名筛选…";
+            _search.Changed2 += delegate { ApplyFilter(); };
+            Controls.Add(_search);
+
+            _typeSeg = new Segmented(new string[] { "全部", "DPC", "ISR" }, new Icon[] { Icon.None, Icon.None, Icon.None });
+            _typeSeg.SelectedChanged += delegate
+            {
+                _typeFilter = _typeSeg.Selected;
+                ApplyFilter();
+            };
+            Controls.Add(_typeSeg);
+
+            _btnReset.Text2 = "清零统计";
+            _btnReset.Ico = Icon.Refresh;
+            _btnReset.Click += delegate { Eng.ResetStats(); _table.ClearRows(); _detail.Set(null); _feed.Set(null, null); };
+            Controls.Add(_btnReset);
+
+            _btnExport.Text2 = "导出驱动 CSV";
+            _btnExport.Ico = Icon.Export;
+            _btnExport.Click += delegate { Export(true); };
+            Controls.Add(_btnExport);
+
+            _cardTable.Title = "驱动延迟表";
+            _cardTable.Subtitle = "点表头排序、点一行看右侧分布";
+            _cardTable.TitleIcon = Icon.Layers;
+            _table.RowHeight = 26;
+            _table.EmptyText = "还没有捕获到 DPC / ISR 事件";
+            // AutoFit：列宽按「表头 + 实际内容」量出来，DPI 或字号一变也不会把 "P99" 截成 "P9…"
+            _table.AddColumn(new TableColumn("驱动 / 模块", 200) { Flex = true, MinWidth = 145 });
+            _table.AddColumn(new TableColumn("类型", 46).Fit(46, 96));
+            _table.AddColumn(new TableColumn("事件数", 68, true).Fit(56, 100));
+            _table.AddColumn(new TableColumn("P95 µs", 64, true).Fit(52, 96));
+            _table.AddColumn(new TableColumn("P99 µs", 64, true).Fit(52, 96));
+            _table.AddColumn(new TableColumn("最大 µs", 74, true).Fit(58, 100));
+            _table.SelectionChanged += delegate { SyncDetail(); };
+            _cardTable.Controls.Add(_table);
+            Controls.Add(_cardTable);
+
+            _cardDetail.Title = "选中驱动详情";
+            _cardDetail.TitleIcon = Icon.Gauge;
+            _cardDetail.Controls.Add(_detail);
+            Controls.Add(_cardDetail);
+
+            _cardSpikes.Title = "尖峰日志";
+            _cardSpikes.Subtitle = "超过阈值的内核回调，按时间倒序";
+            _cardSpikes.TitleIcon = Icon.Warn;
+            _btnExportSpikes.Text2 = "导出";
+            _btnExportSpikes.Ico = Icon.Export;
+            _btnExportSpikes.Click += delegate { Export(false); };
+            _cardSpikes.Controls.Add(_btnExportSpikes);
+            _cardSpikes.Controls.Add(_feed);
+            Controls.Add(_cardSpikes);
+
+            _table.Filter = RowVisible;
+        }
+
+        public override string NavLabel { get { return "DPC / ISR 延迟"; } }
+        public override Icon NavIcon { get { return Icon.Pulse; } }
+
+        private bool RowVisible(TableRow r)
+        {
+            if (_typeFilter != 0)
+            {
+                string t = r.Cells.Length > 1 ? r.Cells[1] : "";
+                if (_typeFilter == 1 && t != "DPC") return false;
+                if (_typeFilter == 2 && t != "ISR") return false;
+            }
+            string q = _search.Value.Trim();
+            if (q.Length > 0)
+            {
+                string nm = r.Cells.Length > 0 ? r.Cells[0] : "";
+                if (nm.IndexOf(q, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            }
+            return true;
+        }
+
+        private void ApplyFilter()
+        {
+            _table.RefreshFilter();
+        }
+
+        private void Export(bool drivers)
+        {
+            try
+            {
+                string dir = Engine.AppDir;
+                string f = drivers ? Eng.ExportDriversCsv(dir) : Eng.ExportSpikesCsv(dir);
+                Eng.Write("exported " + f, LogLevel.Ok);
+                MessageBox.Show(this, "已导出：\n" + f, "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        protected override void DoLayout()
+        {
+            int x0 = Pad, w = Width - Pad * 2;
+            if (w < Theme.Px(200)) return;
+            int y = ContentTop;
+
+            int tbH = Theme.Px(30);
+            int sx = x0;
+            _search.SetBounds(sx, y, Theme.Px(210), tbH); sx += Theme.Px(210) + Gap;
+            _typeSeg.SetBounds(sx, y, Theme.Px(168), tbH); sx += Theme.Px(168) + Gap;
+
+            int rightBtn = x0 + w;
+            _btnExport.SetBounds(rightBtn - Theme.Px(136), y, Theme.Px(136), tbH);
+            _btnReset.SetBounds(_btnExport.Left - Theme.Px(104) - Gap, y, Theme.Px(104), tbH);
+            y += tbH + Gap;
+
+            int rightW = Math.Min(Theme.Px(372), Math.Max(Theme.Px(262), w * 33 / 100));
+            int leftW = w - rightW - Gap;
+            int midH = Height - y - Theme.Px(10);
+            if (midH < Theme.Px(200)) midH = Theme.Px(200);
+
+            _cardTable.SetBounds(x0, y, leftW, midH);
+            int detailH = Math.Max(Theme.Px(196), midH * 45 / 100);
+            _cardDetail.SetBounds(x0 + leftW + Gap, y, rightW, detailH);
+            _cardSpikes.SetBounds(x0 + leftW + Gap, y + detailH + Gap, rightW, midH - detailH - Gap);
+
+            Inner(_cardTable, _table);
+            InnerHead(_cardDetail, _detail);
+            InnerHead(_cardSpikes, _feed);
+            _btnExportSpikes.SetBounds(_cardSpikes.Width - Theme.Px(74) - Theme.Px(12), Theme.Px(11), Theme.Px(74), Theme.Px(24));
+        }
+
+        private static void Inner(Card c, Control inner)
+        {
+            int pad = Theme.Px(10);
+            inner.SetBounds(pad, c.HeaderHeight, Math.Max(Theme.Px(20), c.Width - pad * 2), Math.Max(Theme.Px(20), c.Height - c.HeaderHeight - pad));
+        }
+
+        private static void InnerHead(Card c, Control inner)
+        {
+            int pad = Theme.Px(12);
+            int top = c.HeaderHeight;
+            inner.SetBounds(pad, top, Math.Max(Theme.Px(20), c.Width - pad * 2), Math.Max(Theme.Px(20), c.Height - top - pad + Theme.Px(4)));
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (_table.Parent != null) Inner(_cardTable, _table);
+            if (_detail.Parent != null) InnerHead(_cardDetail, _detail);
+            if (_feed.Parent != null) InnerHead(_cardSpikes, _feed);
+            _btnExportSpikes.SetBounds(_cardSpikes.Width - Theme.Px(74) - Theme.Px(12), Theme.Px(11), Theme.Px(74), Theme.Px(24));
+        }
+
+        private void SyncDetail()
+        {
+            TableRow r = _table.SelectedRow;
+            _detail.Set(r != null ? (r.Tag as DriverStat) : null);
+        }
+
+        public override void OnSample(Snapshot s)
+        {
+            List<TableRow> rows = new List<TableRow>();
+            AddRows(rows, s.Dpc);
+            AddRows(rows, s.Isr);
+            _table.SetRows(rows);
+            // 行对象每秒重建，但 SetRows 会按 RowKey 把选中项找回原位置
+            SyncDetail();
+
+            List<SpikeRec> sp = Eng.Spikes;
+            List<SpikeRec> tail = new List<SpikeRec>();
+            int take = Math.Min(60, sp.Count);
+            for (int i = sp.Count - take; i < sp.Count; i++) tail.Add(sp[i]);
+            _feed.Set(tail, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+
+            HeadRight = "累计尖峰 " + s.SpikeCount.ToString("#,0") + " 次";
+            Invalidate();
+        }
+
+        private static void AddRows(List<TableRow> rows, List<DriverStat> src)
+        {
+            double maxAll = 1;
+            foreach (DriverStat d in src) if (d.Max > maxAll) maxAll = d.Max;
+
+            foreach (DriverStat d in src)
+            {
+                TableRow r = new TableRow();
+                r.Cells = new string[]
+                {
+                    d.Name, d.Type, Fmt.Count(d.Count), Fmt.Us(d.P95), Fmt.Us(d.P99), Fmt.Us(d.Max)
+                };
+                r.Keys = new double[] { 0, 0, d.Count, d.P95, d.P99, d.Max };
+                r.Bars = new double[] { 0, 0, 0, 0, 0, d.Max / maxAll };
+                Color?[] cs = new Color?[6];
+                cs[1] = Theme.Cur.TextSec;
+                cs[2] = Theme.Cur.TextSec;
+                cs[3] = Theme.SevColor(Engine.GradeFor(d.Type, d.P95));
+                cs[4] = Theme.SevColor(Engine.GradeFor(d.Type, d.P99));
+                cs[5] = Theme.SevColor(Engine.GradeFor(d.Type, d.Max));
+                r.Colors = cs;
+                r.Tag = d;
+                r.RowKey = d.Name + "|" + d.Type;
+                rows.Add(r);
+            }
+        }
+    }
+}
