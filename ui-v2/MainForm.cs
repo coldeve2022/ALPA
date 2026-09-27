@@ -653,8 +653,10 @@ namespace ALP2
                     Engine eng = new Engine();
                     eng.InjectSyntheticSpikes(5, 900.0, 32);
                     string csv = eng.ExportSpikesCsv(dir);
+                    string rep = eng.ExportReport(dir);
                     PeriodResult pr = Engine.AnalyzePeriods(eng.Spikes);
                     string report = "csv      = " + csv + Environment.NewLine
+                        + "report   = " + rep + Environment.NewLine
                         + "spikes   = " + eng.Spikes.Count + Environment.NewLine
                         + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);

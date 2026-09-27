@@ -360,12 +360,17 @@ namespace ALP2
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            if (_sb.Visible)
-            {
-                int nv = _sb.Value - Math.Sign(e.Delta) * 3;
-                _sb.Value = Math.Max(_sb.Minimum, Math.Min(_sb.Maximum, nv));
-            }
+            Wheel(e.Delta);
             base.OnMouseWheel(e);
+        }
+
+        /// <summary>给宿主页面的滚轮转发入口（无焦点时滚轮消息到不了这里）。</summary>
+        public void Wheel(int delta)
+        {
+            if (_hb.Visible) return;                 // 横向滚动优先时不动纵向
+            if (!_sb.Visible) return;
+            int nv = _sb.Value - Math.Sign(delta) * 3;
+            _sb.Value = Math.Max(_sb.Minimum, Math.Min(_sb.Maximum, nv));
         }
 
         protected override void OnMouseDoubleClick(MouseEventArgs e)

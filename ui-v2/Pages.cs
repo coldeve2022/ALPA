@@ -131,19 +131,77 @@ namespace ALP2
         }
     }
 
-    /// <summary>紧凑的尖峰流水（时间 / 驱动 / 时长）。</summary>
+    /// <summary>
+    /// 尖峰流水（时间 / 驱动 / 时长）。
+    ///
+    /// 之前只能看到塞进来的最后几十条，更早的既滚动不到也没被传进来 ——
+    /// 用户想回看历史只能去翻导出的 CSV。现在：①页面把引擎保留的完整列表传进来；
+    /// ②控件自己带纵向滚动条与滚轮；③每行两行式排版，把「模块+偏移」也展示出来。
+    /// </summary>
     internal class SpikeFeed : SkinnedControl
     {
         private List<SpikeRec> _items = new List<SpikeRec>();
         private string _empty = "还没有超过阈值的尖峰";
+        private readonly VScrollBar _sb = new VScrollBar();
+        private int _scroll;
 
-        public SpikeFeed() { Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } }; }
+        public SpikeFeed()
+        {
+            Theme.Changed += delegate { try { if (!IsDisposed) Invalidate(); } catch { } };
+            _sb.Width = Math.Max(11, Theme.Px(12));
+            _sb.SmallChange = 1;
+            _sb.Visible = false;
+            _sb.ValueChanged += delegate { _scroll = _sb.Value; Invalidate(); };
+            Controls.Add(_sb);
+        }
 
         public void Set(List<SpikeRec> items, string empty)
         {
             _items = items != null ? items : new List<SpikeRec>();
+            _items.Reverse();          // 新的在上
+            _scroll = 0;
+            if (_sb.Visible) _sb.Value = 0;
             if (empty != null) _empty = empty;
+            LayoutScroll();
             if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        /// <summary>给宿主页面的滚轮转发入口（无焦点时滚轮消息到不了这里）。</summary>
+        public void Wheel(int delta)
+        {
+            if (!_sb.Visible) return;
+            _sb.Value = Math.Max(_sb.Minimum, Math.Min(_sb.Maximum, _sb.Value - Math.Sign(delta) * 3));
+        }
+
+        private int RowH { get { return Theme.Px(34); } }
+
+        private void LayoutScroll()
+        {
+            _sb.SetBounds(Math.Max(0, Width - _sb.Width), 0, _sb.Width, Math.Max(1, Height));
+            int view = Math.Max(1, (Height - Theme.Px(2)) / RowH);
+            bool need = _items.Count > view;
+            if (_sb.Visible != need) _sb.Visible = need;
+            if (!need) { _scroll = 0; _sb.Value = 0; _sb.Maximum = 0; }
+            else
+            {
+                _sb.Minimum = 0;
+                _sb.Maximum = Math.Max(0, _items.Count - view);
+                _sb.LargeChange = Math.Max(1, view);
+                if (_scroll > _sb.Maximum) { _scroll = _sb.Maximum; _sb.Value = _scroll; }
+            }
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            LayoutScroll();
+            Invalidate();
+            base.OnResize(e);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            Wheel(e.Delta);
+            base.OnMouseWheel(e);
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -154,29 +212,39 @@ namespace ALP2
             if (_items.Count == 0)
             {
                 Draw.Text(g, _empty, Theme.F(8.8f, FontStyle.Regular), p.TextMuted, ClientRectangle,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
                 return;
             }
+
             Font ft = Theme.Fm(8.2f, FontStyle.Regular);
             Font fn = Theme.F(8.6f, FontStyle.Regular);
             Font fv = Theme.Fm(8.6f, FontStyle.Bold);
-            int rh = Theme.Px(21);
-            int y = Theme.Px(1);
+            int line1 = Math.Max(Draw.LineH(ft), Draw.LineH(fv));
+            int line2 = Draw.LineH(fn);
+            int rh = RowH;
+            int sbw = _sb.Visible ? _sb.Width : 0;
             int timeW = Theme.Px(58);
             int valW = Theme.Px(67);
-            for (int i = _items.Count - 1; i >= 0; i--)
+            int y = Theme.Px(1);
+
+            g.SetClip(new Rectangle(0, 0, Math.Max(1, Width - sbw), Math.Max(1, Height)));
+            for (int idx = _scroll; idx < _items.Count && y + rh <= Height + Theme.Px(2); idx++, y += rh)
             {
-                if (y + rh > Height) break;
-                SpikeRec r = _items[i];
+                SpikeRec r = _items[idx];
                 Sev sv = Engine.GradeFor(r.Type, r.Us);
-                Draw.Text(g, r.T.ToString("HH:mm:ss"), ft, p.TextMuted, new Rectangle(0, y, timeW, rh),
+                Draw.Text(g, r.T.ToString("HH:mm:ss"), ft, p.TextMuted, new Rectangle(0, y, timeW, line1),
                     TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                Draw.Text(g, r.Driver, fn, p.TextPri, new Rectangle(timeW, y, Math.Max(Theme.Px(30), Width - timeW - valW), rh),
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
-                Draw.Text(g, Fmt.Us(r.Us) + " µs", fv, Theme.SevColor(sv), new Rectangle(Width - valW, y, valW, rh),
+                Draw.Text(g, Fmt.Us(r.Us) + " µs", fv, Theme.SevColor(sv), new Rectangle(Width - sbw - valW, y, valW, line1),
                     TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
-                y += rh;
+                string nm = string.IsNullOrEmpty(r.Where) ? r.Driver : r.Where;
+                Draw.Text(g, nm, fn, p.TextPri, new Rectangle(0, y + line1, Math.Max(Theme.Px(30), Width - sbw - Theme.Px(6)), line2),
+                    TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                Draw.HLine(g, 0, Width - sbw, y + rh - 1, p.GridLine);
             }
+            g.ResetClip();
+
+            using (SolidBrush b = new SolidBrush(p.SurfaceAlt))
+                g.FillRectangle(b, Width - sbw, 0, sbw, Height);
         }
     }
 
@@ -449,10 +517,8 @@ namespace ALP2
             _chart.CritUs = Eng.DpcThreshold * 2;
 
             List<SpikeRec> sp = Eng.Spikes;
-            List<SpikeRec> tail = new List<SpikeRec>();
-            int take = Math.Min(40, sp.Count);
-            for (int i = sp.Count - take; i < sp.Count; i++) tail.Add(sp[i]);
-            _feed.Set(tail, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+            // 传完整列表，让尖峰流自己滚动看历史（以前只给最后 40 条，更早的根本看不到）
+            _feed.Set(sp, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
 
             BuildTop(s);
             BuildMini(s);
@@ -547,6 +613,7 @@ namespace ALP2
         private readonly Segmented _typeSeg;
         private readonly FlatButton _btnReset = new FlatButton();
         private readonly FlatButton _btnExport = new FlatButton();
+        private readonly FlatButton _btnReport = new FlatButton();
         private readonly Card _cardTable = new Card();
         private readonly Card _cardDetail = new Card();
         private readonly Card _cardSpikes = new Card();
@@ -584,6 +651,11 @@ namespace ALP2
             _btnExport.Ico = Icon.Export;
             _btnExport.Click += delegate { Export(true); };
             Controls.Add(_btnExport);
+
+            _btnReport.Text2 = "导出报告";
+            _btnReport.Ico = Icon.Info;
+            _btnReport.Click += delegate { ExportReportFile(); };
+            Controls.Add(_btnReport);
 
             _cardTable.Title = "驱动延迟表";
             _cardTable.Subtitle = "点表头排序、点一行看右侧分布";
@@ -644,6 +716,21 @@ namespace ALP2
             _table.RefreshFilter();
         }
 
+        private void ExportReportFile()
+        {
+            try
+            {
+                string f = Eng.ExportReport(Engine.AppDir);
+                Eng.Write("report exported: " + f, LogLevel.Ok);
+                MessageBox.Show(this, "已导出分析报告（结论/系统信息/DPC与ISR统计/每核心数据/周期判定）：\n" + f,
+                    "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void Export(bool drivers)
         {
             try
@@ -671,7 +758,8 @@ namespace ALP2
             _typeSeg.SetBounds(sx, y, Theme.Px(168), tbH); sx += Theme.Px(168) + Gap;
 
             int rightBtn = x0 + w;
-            _btnExport.SetBounds(rightBtn - Theme.Px(136), y, Theme.Px(136), tbH);
+            _btnReport.SetBounds(rightBtn - Theme.Px(110), y, Theme.Px(110), tbH);
+            _btnExport.SetBounds(_btnReport.Left - Theme.Px(136) - Gap, y, Theme.Px(136), tbH);
             _btnReset.SetBounds(_btnExport.Left - Theme.Px(104) - Gap, y, Theme.Px(104), tbH);
             y += tbH + Gap;
 
@@ -713,6 +801,18 @@ namespace ALP2
             _btnExportSpikes.SetBounds(_cardSpikes.Width - Theme.Px(74) - Theme.Px(12), Theme.Px(11), Theme.Px(74), Theme.Px(24));
         }
 
+        /// <summary>
+        /// 滚轮消息只发给有焦点的控件，而这些自绘控件默认不抢焦点 ——
+        /// 所以在页面这一层接住滚轮，按光标位置转发给下面的表/列表。
+        /// </summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            Point cur = PointToClient(Cursor.Position);
+            if (_feed.Bounds.Contains(cur)) _feed.Wheel(e.Delta);
+            else if (_table.Bounds.Contains(_table.PointToClient(Cursor.Position))) _table.Wheel(e.Delta);
+            base.OnMouseWheel(e);
+        }
+
         private void SyncDetail()
         {
             TableRow r = _table.SelectedRow;
@@ -729,10 +829,7 @@ namespace ALP2
             SyncDetail();
 
             List<SpikeRec> sp = Eng.Spikes;
-            List<SpikeRec> tail = new List<SpikeRec>();
-            int take = Math.Min(60, sp.Count);
-            for (int i = sp.Count - take; i < sp.Count; i++) tail.Add(sp[i]);
-            _feed.Set(tail, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+            _feed.Set(sp, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
 
             HeadRight = "累计尖峰 " + s.SpikeCount.ToString("#,0") + " 次";
             UpdatePeriodicity(s);

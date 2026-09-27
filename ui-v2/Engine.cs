@@ -135,6 +135,14 @@ namespace ALP2
         public double P99 { get { return Hist.Percentile(0.99); } }
     }
 
+    /// <summary>单核心的中断统计，报告的「每核心数据」节用。</summary>
+    internal class CpuAgg
+    {
+        public long Count;
+        public double TotalUs;
+        public double MaxUs;
+    }
+
     internal class ProcRow
     {
         public int Pid;
@@ -279,6 +287,27 @@ namespace ALP2
         private readonly long[] _isrCountAtLast = new long[2];
         private long _spikeCount;
         private long _lastSpikeTs;   // Stopwatch.GetTimestamp()，用于算尖峰间隔
+
+        // ---- 报告用的聚合口径（每核心 / 分档 / 总量）----
+        private CpuAgg[] _dpcCpu = new CpuAgg[Math.Max(1, Environment.ProcessorCount)];
+        private CpuAgg[] _isrCpu = new CpuAgg[Math.Max(1, Environment.ProcessorCount)];
+        private readonly long[] _dpcBuckets = new long[6];
+        private readonly long[] _isrBuckets = new long[6];
+        private double _dpcTotalUs;
+        private double _isrTotalUs;
+
+        /// <summary>LatencyMon 式的分档区间（微秒）。</summary>
+        public static readonly string[] BucketNames = { "<250", "250-500", "500-999", "1000-1999", "2000-3999", ">=4000" };
+
+        private static int BucketIndex(double us)
+        {
+            if (us < 250) return 0;
+            if (us < 500) return 1;
+            if (us < 1000) return 2;
+            if (us < 2000) return 3;
+            if (us < 4000) return 4;
+            return 5;
+        }
 
         // 性能计数器
         private PerformanceCounter _pcProcQueue, _pcCtxSw, _pcIntTotal, _pcParked;
@@ -794,35 +823,13 @@ namespace ALP2
             return "addr_" + addr.ToString("X");
         }
 
-        private void OnDpcOrIsr(object data, Dictionary<string, DriverStat> target, string type)
+        /// <summary>
+        /// 把一次 DPC/ISR 样本并入统计。真实事件与 --selftest 的合成数据共用这一条路径，
+        /// 保证「报告里的每个口径」都能在无管理员权限时被验证。
+        /// </summary>
+        private void RecordSample(Dictionary<string, DriverStat> target, string driver,
+            string where, string type, double us, int cpu, double atSec)
         {
-            double us = 0;
-            bool have = false;
-            ulong routine = 0;
-
-            DPCTraceData d = data as DPCTraceData;
-            if (d != null)
-            {
-                object v = d.PayloadByName("ElapsedTimeMSec");
-                if (v != null) { us = Convert.ToDouble(v) * 1000.0; have = true; }
-                routine = (ulong)d.Routine;
-            }
-            else
-            {
-                ISRTraceData i = data as ISRTraceData;
-                if (i != null)
-                {
-                    object v = i.PayloadByName("ElapsedTimeMSec");
-                    if (v != null) { us = Convert.ToDouble(v) * 1000.0; have = true; }
-                    routine = (ulong)i.Routine;
-                }
-            }
-            if (!have) return;
-
-            long off;
-            string driver = ResolveWhere(routine, out off);
-            string where = off > 0 ? driver + "+0x" + off.ToString("x") : driver;
-
             lock (_statLock)
             {
                 DriverStat st;
@@ -836,31 +843,83 @@ namespace ALP2
                 st.Cur = us;
                 st.Count++;
                 st.Hist.Add(us);
-            }
 
-            double thr = type == "DPC" ? DpcThreshold : IsrThreshold;
-            if (us >= thr)
-            {
-                Interlocked.Increment(ref _spikeCount);
-                SpikeRec r = new SpikeRec();
-                r.T = DateTime.Now;
-                r.Driver = driver;
-                r.Where = where;
-                r.Type = type;
-                r.Us = us;
-                // 间隔用 Stopwatch 时间戳算，比 DateTime 的 15ms 粒度准得多
-                long nowTs = Stopwatch.GetTimestamp();
-                long prevTs = Interlocked.Exchange(ref _lastSpikeTs, nowTs);
-                r.SincePrevMs = prevTs == 0 ? 0 : (nowTs - prevTs) * 1000.0 / Stopwatch.Frequency;
-                r.AtSec = _uptime.Elapsed.TotalSeconds;
-                lock (_statLock)
+                // 每核心 / 分档 / 总量：报告要用，不能等导出时再回溯（直方图分桶回不出精确分档）
+                bool isDpc = type == "DPC";
+                CpuAgg[] arr = isDpc ? _dpcCpu : _isrCpu;
+                if (cpu >= 0)
                 {
+                    if (cpu >= arr.Length)
+                    {
+                        CpuAgg[] bigger = new CpuAgg[cpu + 8];
+                        if (arr != null) arr.CopyTo(bigger, 0);
+                        arr = bigger;
+                        if (isDpc) _dpcCpu = arr; else _isrCpu = arr;
+                    }
+                    CpuAgg ca = arr[cpu];
+                    if (ca == null) { ca = new CpuAgg(); arr[cpu] = ca; }
+                    ca.Count++;
+                    ca.TotalUs += us;
+                    if (us > ca.MaxUs) ca.MaxUs = us;
+                }
+                (isDpc ? _dpcBuckets : _isrBuckets)[BucketIndex(us)]++;
+                if (isDpc) _dpcTotalUs += us; else _isrTotalUs += us;
+
+                if (us >= (isDpc ? DpcThreshold : IsrThreshold))
+                {
+                    _spikeCount++;
+                    SpikeRec r = new SpikeRec();
+                    r.T = DateTime.Now;
+                    r.Driver = driver;
+                    r.Where = where;
+                    r.Type = type;
+                    r.Us = us;
+                    long nowTs = Stopwatch.GetTimestamp();
+                    long prevTs = Interlocked.Exchange(ref _lastSpikeTs, nowTs);
+                    r.SincePrevMs = prevTs == 0 ? 0 : (nowTs - prevTs) * 1000.0 / Stopwatch.Frequency;
+                    // atSec >= 0 表示调用方自带时间轴（自检注入用），否则取真实时钟
+                    r.AtSec = atSec >= 0 ? atSec : _uptime.Elapsed.TotalSeconds;
                     _spikes.Add(r);
                     if (_spikes.Count > MaxSpikes) _spikes.RemoveRange(0, _spikes.Count - MaxSpikes);
+                    Action<SpikeRec> h = Spike;
+                    if (h != null) h(r);
                 }
-                Action<SpikeRec> h = Spike;
-                if (h != null) h(r);
             }
+        }
+
+        private void OnDpcOrIsr(object data, Dictionary<string, DriverStat> target, string type)
+        {
+            double us = 0;
+            bool have = false;
+            ulong routine = 0;
+            int cpu = -1;
+
+            DPCTraceData d = data as DPCTraceData;
+            if (d != null)
+            {
+                object v = d.PayloadByName("ElapsedTimeMSec");
+                if (v != null) { us = Convert.ToDouble(v) * 1000.0; have = true; }
+                routine = (ulong)d.Routine;
+                try { cpu = d.ProcessorNumber; } catch { }
+            }
+            else
+            {
+                ISRTraceData i = data as ISRTraceData;
+                if (i != null)
+                {
+                    object v = i.PayloadByName("ElapsedTimeMSec");
+                    if (v != null) { us = Convert.ToDouble(v) * 1000.0; have = true; }
+                    routine = (ulong)i.Routine;
+                    try { cpu = i.ProcessorNumber; } catch { }
+                }
+            }
+            if (!have) return;
+
+            long off;
+            string driver = ResolveWhere(routine, out off);
+            string where = off > 0 ? driver + "+0x" + off.ToString("x") : driver;
+            RecordSample(target, driver, where, type, us, cpu, -1);
+
         }
 
         // =====================================================================
@@ -1464,11 +1523,33 @@ namespace ALP2
         {
             List<DriverStat> list = new List<DriverStat>(d.Values);
             list.Sort(delegate (DriverStat a, DriverStat b) { return b.Max.CompareTo(a.Max); });
-            foreach (DriverStat s in list)
+            foreach (DriverStat st in list)
             {
-                sb.AppendLine(string.Format("{0};{1};{2};{3:F2};{4:F2};{5:F2};{6:F2};{7:F2};{8:F2}",
-                    s.Name, s.Type, s.Count, s.Cur, s.Avg, s.P50, s.P95, s.P99, s.Max));
+                sb.AppendLine(CsvLine(st.Name, st.Type, st.Count.ToString(),
+                    st.Cur.ToString("F2"), st.Avg.ToString("F2"), st.P50.ToString("F2"),
+                    st.P95.ToString("F2"), st.P99.ToString("F2"), st.Max.ToString("F2")));
             }
+        }
+
+        /// <summary>
+        /// 标准 CSV 字段转义：含逗号/引号/换行的字段用引号包起来，内部引号翻倍。
+        ///
+        /// 这里必须较真：分隔符选错，用户打开就是「整行挤在一列里」。
+        /// 之前用分号做分隔，而中文版 Excel 的列表分隔符是逗号，整份文件就只显示一列 ——
+        /// 所以统一改成逗号，并按 RFC 4180 转义（本工具的字段值不含逗号，理论上不会触发）。
+        /// </summary>
+        private static string CsvLine(params object[] fields)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (i > 0) sb.Append(',');
+                string v = fields[i] == null ? "" : fields[i].ToString();
+                if (v.IndexOf(',') >= 0 || v.IndexOf('"') >= 0 || v.IndexOf('\n') >= 0 || v.IndexOf('\r') >= 0)
+                    v = '"' + v.Replace("\"", "\"\"") + '"';
+                sb.Append(v);
+            }
+            return sb.ToString();
         }
 
         /// <summary>
@@ -1478,29 +1559,22 @@ namespace ALP2
         ///    数字列则不受影响，所以做间隔分析要看这两列；
         ///  · 文件头直接写入周期性分析的结论，拿到这个 CSV 就能看到"是不是固定间隔"。
         /// </summary>
+        /// <summary>
+        /// 导出尖峰明细（逗号分隔的标准 CSV，Excel 双击即可分列）。
+        ///
+        /// 设计要点：
+        ///  · 除了可读时间，再给 T+(s) 与 SincePrev(ms) 两个纯数字列 ——
+        ///    Excel/WPS 会把时间列按本地日期格式重排（秒会被吃掉），数字列不会受影响；
+        ///  · 周期判定 / 间隔统计这类「结论」不塞进 CSV，统一放进报告文件（ExportReport），
+        ///    保持 CSV 是纯数据，谁打开都不会多出几行对不上的东西。
+        /// </summary>
         public string ExportSpikesCsv(string dir)
         {
             List<SpikeRec> snap;
             lock (_statLock) snap = new List<SpikeRec>(_spikes);
 
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("# ALPA v2 kernel spike detail");
-            sb.AppendLine("# exported; " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            sb.AppendLine("# threshold; DPC >= " + DpcThreshold.ToString("0") + " us; ISR >= " + IsrThreshold.ToString("0") + " us");
-            sb.AppendLine("# hint; Excel/WPS 直接打开会把时间列改成本地格式(秒会丢失)，分析间隔请用 T+(s) 与 SincePrev(ms) 两列");
-
-            PeriodResult pr = AnalyzePeriods(snap);
-            sb.AppendLine("# periodicity; " + (pr == null
-                ? "样本不足或未发现固定间隔（相位集中度低于阈值）"
-                : pr.Describe().Replace(';', ',')));
-
-            double med, mn, mx;
-            IntervalStatsOf(snap, out med, out mn, out mx);
-            if (med > 0)
-                sb.AppendLine("# interval; median " + med.ToString("0.#") + " ms; min " + mn.ToString("0.#")
-                    + " ms; max " + mx.ToString("0.#") + " ms");
-
-            sb.AppendLine("Seq;Time;T+(s);SincePrev(ms);Driver;Location;Type;Duration(us)");
+            sb.AppendLine(CsvLine("Seq", "Time", "T+(s)", "SincePrev(ms)", "Driver", "Location", "Type", "Duration(us)"));
 
             int i = 0;
             foreach (SpikeRec r in snap)
@@ -1508,15 +1582,378 @@ namespace ALP2
                 i++;
                 double prev = r.SincePrevMs;
                 if (prev <= 0 && i > 1) prev = (r.AtSec - snap[i - 2].AtSec) * 1000.0;
-                sb.AppendLine(string.Format("{0};{1:yyyy-MM-dd HH:mm:ss.fff};{2};{3};{4};{5};{6};{7:F2}",
-                    i, r.T, r.AtSec.ToString("0.###"), prev.ToString("0.##"),
-                    r.Driver, r.Where, r.Type, r.Us));
+                sb.AppendLine(CsvLine(i.ToString(),
+                    r.T.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                    r.AtSec.ToString("0.###"), prev.ToString("0.##"),
+                    r.Driver, r.Where, r.Type, r.Us.ToString("F2")));
             }
 
             string f = Path.Combine(dir, "ALPA_v2_Spikes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv");
             File.WriteAllText(f, sb.ToString(), new UTF8Encoding(true));
             return f;
         }
+
+        /// <summary>
+        /// 导出 LatencyMon 式的分析报告（纯文本）：结论、系统信息、DPC/ISR 统计、
+        /// 分档计数、每核心数据、尖峰周期性、驱动排行与健康检查建议，一次拿全。
+        /// </summary>
+        public string ExportReport(string dir)
+        {
+            List<DriverStat> dpc, isr;
+            List<SpikeRec> spikes;
+            List<CheckItem> checks;
+            double uptimeSec;
+            lock (_statLock)
+            {
+                dpc = new List<DriverStat>(_dpc.Values);
+                isr = new List<DriverStat>(_isr.Values);
+                spikes = new List<SpikeRec>(_spikes);
+                checks = new List<CheckItem>(_checks);
+                uptimeSec = _uptime.Elapsed.TotalSeconds;
+            }
+            dpc.Sort(delegate (DriverStat a, DriverStat b) { return b.Max.CompareTo(a.Max); });
+            isr.Sort(delegate (DriverStat a, DriverStat b) { return b.Max.CompareTo(a.Max); });
+
+            uint tmi, tma, tcur;
+            double timerMs = NtQueryTimerResolution(out tmi, out tma, out tcur) == 0 ? tcur / 10000.0 : 0;
+            double mouseHz = _mouseHz;
+
+            StringBuilder sb = new StringBuilder();
+            Ruler(sb, '=');
+            sb.AppendLine("ALPA v2 内核延迟分析报告 / Kernel latency report");
+            sb.AppendLine("生成时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            if (uptimeSec > 0) sb.AppendLine("采样时长: " + uptimeSec.ToString("0") + " 秒 (" + TimeSpan.FromSeconds(uptimeSec).ToString().Substring(0, 8) + ")");
+            sb.AppendLine("判定阈值: DPC >= " + DpcThreshold + " us ; ISR >= " + IsrThreshold + " us");
+            Ruler(sb, '=');
+            sb.AppendLine();
+
+            // ---------- 一、结论 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("一、结论  CONCLUSION");
+            Ruler(sb, '_');
+            List<string> con = BuildConclusions(dpc, isr, spikes, timerMs, checks);
+            foreach (string c in con) sb.AppendLine("  * " + c);
+            sb.AppendLine();
+            sb.AppendLine("说明: 本报告由 ALPA v2 依据 ETW 内核追踪(PerfInfo DPC/ISR)与性能计数器生成;");
+            sb.AppendLine("      每进程硬缺页与「中断到用户进程延迟」这两项未采集（需要额外的内核栈遍历）。");
+            sb.AppendLine();
+
+            // ---------- 二、系统信息 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("二、系统信息  SYSTEM");
+            Ruler(sb, '_');
+            foreach (string[] kv in SystemInfoRows())
+                sb.AppendLine(Pad(kv[0], 26) + kv[1]);
+            sb.AppendLine("定时器精度: " + timerMs.ToString("0.####") + " ms");
+            sb.AppendLine("鼠标回报率: " + (mouseHz > 1 ? mouseHz.ToString("0") + " Hz" : "未检测到移动"));
+            sb.AppendLine();
+
+            // ---------- 三、DPC ----------
+            Ruler(sb, '_');
+            sb.AppendLine("三、DPC 统计  REPORTED DPCs");
+            Ruler(sb, '_');
+            sb.AppendLine("DPC 例程运行时会占住当前 CPU，期间用户线程无法被调度 —— 这是掉帧与卡顿的直接来源之一。");
+            WriteAgg(sb, "DPC", dpc, _dpcBuckets, _dpcTotalUs, uptimeSec);
+            sb.AppendLine();
+
+            // ---------- 四、ISR ----------
+            Ruler(sb, '_');
+            sb.AppendLine("四、ISR 统计  REPORTED ISRs");
+            Ruler(sb, '_');
+            WriteAgg(sb, "ISR", isr, _isrBuckets, _isrTotalUs, uptimeSec);
+            sb.AppendLine();
+
+            // ---------- 五、尖峰周期性 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("五、尖峰周期性  PERIODICITY");
+            Ruler(sb, '_');
+            PeriodResult pr = AnalyzePeriods(spikes);
+            sb.AppendLine("尖峰总数: " + spikes.Count.ToString("#,0"));
+            sb.AppendLine("周期判定: " + (pr == null ? "样本不足或未发现固定间隔" : pr.Describe()));
+            double med, mn, mx;
+            IntervalStatsOf(spikes, out med, out mn, out mx);
+            if (med > 0)
+            {
+                sb.AppendLine("相邻间隔: 中位 " + FmtMs(med) + " ; 最小 " + FmtMs(mn) + " ; 最大 " + FmtMs(mx));
+                sb.AppendLine("         （若中位远小于周期，说明尖峰是成阵出现的，阵内密、阵间疏）");
+            }
+            // 每一“阵”的起始时间：与上一个尖峰间隔超过 1/10 周期就算新阵
+            if (pr != null && spikes.Count > 3)
+            {
+                List<DateTime> starts = new List<DateTime>();
+                double gap = Math.Max(0.5, pr.PeriodSec * 0.25);
+                for (int i = 0; i < spikes.Count; i++)
+                {
+                    double prev = i == 0 ? 1e9 : (spikes[i].AtSec - spikes[i - 1].AtSec);
+                    if (prev > gap) starts.Add(spikes[i].T);
+                }
+                sb.AppendLine("检测到 " + starts.Count + " 个阵，起始时间:");
+                foreach (DateTime t in starts) sb.AppendLine("    " + t.ToString("yyyy-MM-dd HH:mm:ss"));
+            }
+            sb.AppendLine();
+
+            // ---------- 六、每核心数据 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("六、每核心数据  PER CPU");
+            Ruler(sb, '_');
+            int cores = Math.Max(_dpcCpu.Length, _isrCpu.Length);
+            for (int c = 0; c < cores; c++)
+            {
+                CpuAgg dc = c < _dpcCpu.Length ? _dpcCpu[c] : null;
+                CpuAgg ic = c < _isrCpu.Length ? _isrCpu[c] : null;
+                if ((dc == null || dc.Count == 0) && (ic == null || ic.Count == 0)) continue;
+                sb.AppendLine("CPU " + c + ":");
+                if (dc != null && dc.Count > 0)
+                    sb.AppendLine("    DPC 次数 " + dc.Count.ToString("#,0")
+                        + " ; 最高 " + dc.MaxUs.ToString("0.#") + " us"
+                        + " ; 总计 " + (dc.TotalUs / 1e6).ToString("0.###") + " 秒");
+                if (ic != null && ic.Count > 0)
+                    sb.AppendLine("    ISR 次数 " + ic.Count.ToString("#,0")
+                        + " ; 最高 " + ic.MaxUs.ToString("0.#") + " us"
+                        + " ; 总计 " + (ic.TotalUs / 1e6).ToString("0.###") + " 秒");
+            }
+            sb.AppendLine();
+
+            // ---------- 七、驱动排行 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("七、驱动排行（按最高值，前 15）  TOP DRIVERS");
+            Ruler(sb, '_');
+            sb.AppendLine(Pad("驱动", 26) + Pad("类型", 7) + Pad("次数", 12) + Pad("P50", 10) + Pad("P95", 10) + Pad("P99", 10) + "最高(us)");
+            int shown = 0;
+            foreach (DriverStat d in dpc)
+            {
+                if (shown++ >= 15) break;
+                sb.AppendLine(Pad(d.Name, 26) + Pad(d.Type, 7) + Pad(d.Count.ToString("#,0"), 12)
+                    + Pad(d.P50.ToString("0.#"), 10) + Pad(d.P95.ToString("0.#"), 10)
+                    + Pad(d.P99.ToString("0.#"), 10) + d.Max.ToString("0.#"));
+            }
+            foreach (DriverStat d in isr)
+            {
+                if (shown++ >= 15) break;
+                sb.AppendLine(Pad(d.Name, 26) + Pad(d.Type, 7) + Pad(d.Count.ToString("#,0"), 12)
+                    + Pad(d.P50.ToString("0.#"), 10) + Pad(d.P95.ToString("0.#"), 10)
+                    + Pad(d.P99.ToString("0.#"), 10) + d.Max.ToString("0.#"));
+            }
+            sb.AppendLine();
+
+            // ---------- 八、健康检查 ----------
+            Ruler(sb, '_');
+            sb.AppendLine("八、健康检查中的非绿项  CHECKS");
+            Ruler(sb, '_');
+            int bad = 0;
+            foreach (CheckItem c in checks)
+            {
+                if (c.Sev == Sev.Ok) continue;
+                sb.AppendLine("  [" + c.Sev.ToString().ToUpper() + "] " + c.Title + " = " + c.Value
+                    + (string.IsNullOrEmpty(c.Hint) ? "" : "   —— " + c.Hint));
+                bad++;
+            }
+            if (bad == 0) sb.AppendLine("  （全部正常）");
+            sb.AppendLine();
+
+            string f = Path.Combine(dir, "ALPA_v2_Report_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt");
+            File.WriteAllText(f, sb.ToString(), new UTF8Encoding(true));
+            Write("report exported: " + f, LogLevel.Ok);
+            return f;
+        }
+
+        private static void Ruler(StringBuilder sb, char ch)
+        {
+            sb.AppendLine(new string(ch, 78));
+        }
+
+        private static string Pad(string s, int w)
+        {
+            if (s == null) s = "";
+            int width = 0;
+            foreach (char ch in s) width += ch > 0x2E80 ? 2 : 1;   // CJK 按两列宽算，尽量对齐
+            if (width >= w) return s;
+            return s + new string(' ', w - width);
+        }
+
+        private static string FmtMs(double ms)
+        {
+            if (ms >= 1000) return (ms / 1000.0).ToString("0.##") + " 秒";
+            return ms.ToString("0.#") + " 毫秒";
+        }
+
+        private static void WriteAgg(StringBuilder sb, string kind, List<DriverStat> list, long[] buckets, double totalUs, double uptimeSec)
+        {
+            if (list.Count == 0)
+            {
+                sb.AppendLine("  （没有 " + kind + " 数据 —— 需要以管理员权限运行才会采集）");
+                return;
+            }
+            double maxUs = 0; string maxDrv = "";
+            double p99Us = 0; string p99Drv = "";
+            long total = 0;
+            foreach (DriverStat d in list)
+            {
+                total += d.Count;
+                if (d.Max > maxUs) { maxUs = d.Max; maxDrv = d.Name; }
+                if (d.P99 > p99Us) { p99Us = d.P99; p99Drv = d.Name; }
+            }
+            sb.AppendLine("最高 " + kind + " 例程执行时间 (us): " + maxUs.ToString("0.#") + "   驱动: " + maxDrv);
+            sb.AppendLine("P99 最高的驱动 (us): " + p99Us.ToString("0.#") + "   驱动: " + p99Drv);
+            if (uptimeSec > 0.5)
+            {
+                double pct = (totalUs / 1e6) / (uptimeSec * Environment.ProcessorCount) * 100.0;
+                sb.AppendLine(kind + " 总时间占比: " + pct.ToString("0.####") + " %"
+                    + "   (总执行 " + (totalUs / 1e6).ToString("0.###") + " 秒 / "
+                    + uptimeSec.ToString("0") + " 秒 x " + Environment.ProcessorCount + " 核)");
+            }
+            sb.AppendLine(kind + " 总次数: " + total.ToString("#,0"));
+            sb.AppendLine("分档计数:");
+            for (int i = 0; i < buckets.Length; i++)
+                sb.AppendLine("    执行时间 " + BucketNames[i].PadRight(10) + " us : " + buckets[i].ToString("#,0"));
+
+            list.Sort(delegate (DriverStat a, DriverStat b) { return b.P99.CompareTo(a.P99); });
+            sb.AppendLine("按 P99 排序的前几名:");
+            for (int i = 0; i < list.Count && i < 8; i++)
+                sb.AppendLine("    " + Pad(list[i].Name, 24) + "P50 " + Pad(list[i].P50.ToString("0.#"), 9)
+                    + "P95 " + Pad(list[i].P95.ToString("0.#"), 9) + "P99 " + Pad(list[i].P99.ToString("0.#"), 9)
+                    + "Max " + list[i].Max.ToString("0.#") + " us");
+            list.Sort(delegate (DriverStat a, DriverStat b) { return b.Max.CompareTo(a.Max); });
+        }
+
+        /// <summary>依据当前数据自动生成中文结论，一条一条列，全是可核对的事实。</summary>
+        private List<string> BuildConclusions(List<DriverStat> dpc, List<DriverStat> isr,
+            List<SpikeRec> spikes, double timerMs, List<CheckItem> checks)
+        {
+            List<string> c = new List<string>();
+            if (dpc.Count == 0 && isr.Count == 0)
+            {
+                c.Add("没有采集到 DPC / ISR 数据 —— 内核追踪需要管理员权限，请提权后重新运行。");
+                return c;
+            }
+
+            double maxDpc = 0; string maxDpcDrv = "";
+            foreach (DriverStat d in dpc) if (d.Max > maxDpc) { maxDpc = d.Max; maxDpcDrv = d.Name; }
+            if (maxDpc > 0)
+            {
+                if (maxDpc >= 1000)
+                    c.Add("存在执行时间明显过长的 DPC 例程：最高 " + maxDpc.ToString("0.#") + " µs（" + maxDpcDrv
+                        + "）。超过 1000 µs 的 DPC 足以让一帧画面迟到。");
+                else if (maxDpc >= 500)
+                    c.Add("DPC 峰值偏高：最高 " + maxDpc.ToString("0.#") + " µs（" + maxDpcDrv
+                        + "）。高于 500 µs 属于需要关注，但尚未达到明显掉帧的水平。");
+                else
+                    c.Add("DPC 峰值 " + maxDpc.ToString("0.#") + " µs（" + maxDpcDrv + "），在健康范围内。");
+            }
+
+            string[] netDrivers = { "ndis", "tcpip", "netio", "wlan", "nwifi", "ndu", "vwififlt" };
+            foreach (DriverStat d in dpc)
+            {
+                bool hit = false;
+                foreach (string n in netDrivers) if (d.Name.ToLower().StartsWith(n)) { hit = true; break; }
+                if (hit && d.P99 >= 300)
+                {
+                    c.Add("至少一个问题与网络相关（" + d.Name + "，P99 " + d.P99.ToString("0.#")
+                        + " µs）。若使用无线网卡，可尝试禁用它对比；有线则检查网卡驱动与「中断调节」设置。");
+                    break;
+                }
+            }
+
+            string[] gpuDrivers = { "dxgkrnl", "dxgmms", "nvlddmkm", "atikmdag", "amdkmdag", "igdkmd64", "nv4" };
+            foreach (DriverStat d in dpc)
+            {
+                bool hit = false;
+                foreach (string n in gpuDrivers) if (d.Name.ToLower().StartsWith(n)) { hit = true; break; }
+                if (hit && d.P99 >= 300)
+                {
+                    c.Add("显卡驱动（" + d.Name + "）的 DPC 参与度较高（P99 " + d.P99.ToString("0.#")
+                        + " µs）。全屏游戏、硬件加速播放与多显示器场景会放大它。");
+                    break;
+                }
+            }
+
+            PeriodResult pr = AnalyzePeriods(spikes);
+            if (pr != null && pr.Cycles >= 2)
+                c.Add("尖峰呈固定周期出现（" + pr.Describe() + "）。周期性强烈指向某个按固定节拍运行的常驻组件"
+                    + "（安全软件心跳、厂商服务、监控代理），而不是随机负载。");
+
+            if (timerMs > 1.001)
+                c.Add("系统定时器精度为 " + timerMs.ToString("0.####") + " ms（未锁到 1 ms）。低延迟场景可由程序调用 timeBeginPeriod(1) 锁定。");
+            else if (timerMs > 0)
+                c.Add("系统定时器精度 " + timerMs.ToString("0.####") + " ms，已处于 1 ms 级（有程序在请求高精度定时器）。");
+
+            foreach (CheckItem k in checks)
+            {
+                if (k.Sev == Sev.Ok || string.IsNullOrEmpty(k.Hint)) continue;
+                if (k.Sev == Sev.Crit || k.Sev == Sev.Warn)
+                    c.Add("体检项「" + k.Title + "」= " + k.Value + "：" + k.Hint);
+            }
+
+            if (c.Count == 1) c.Add("未发现明确的异常模式。");
+            return c;
+        }
+
+        /// <summary>系统信息（只查一次并缓存；WMI 查询失败时逐项降级为未知）。</summary>
+        private static List<string[]> SystemInfoRows()
+        {
+            if (_sysInfoRows != null) return _sysInfoRows;
+            List<string[]> r = new List<string[]>();
+            r.Add(new string[] { "计算机名", Environment.MachineName });
+
+            string os = "", osVer = "";
+            try
+            {
+                using (System.Management.ManagementObjectSearcher se =
+                    new System.Management.ManagementObjectSearcher("SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem"))
+                {
+                    foreach (System.Management.ManagementBaseObject o in se.Get())
+                    {
+                        os = Convert.ToString(o["Caption"]);
+                        osVer = Convert.ToString(o["Version"]) + " build " + Convert.ToString(o["BuildNumber"]);
+                        break;
+                    }
+                }
+            }
+            catch { }
+            r.Add(new string[] { "操作系统", (os + "  " + osVer + " (" + (Environment.Is64BitOperatingSystem ? "x64" : "x86") + ")").Trim() });
+
+            string hw = "";
+            ulong ram = 0;
+            try
+            {
+                using (System.Management.ManagementObjectSearcher se =
+                    new System.Management.ManagementObjectSearcher("SELECT Manufacturer, Model, TotalPhysicalMemory FROM Win32_ComputerSystem"))
+                {
+                    foreach (System.Management.ManagementBaseObject o in se.Get())
+                    {
+                        hw = Convert.ToString(o["Manufacturer"]) + " " + Convert.ToString(o["Model"]);
+                        ram = Convert.ToUInt64(o["TotalPhysicalMemory"]);
+                        break;
+                    }
+                }
+            }
+            catch { }
+            r.Add(new string[] { "硬件", hw });
+            if (ram > 0) r.Add(new string[] { "物理内存", (ram / 1024.0 / 1024 / 1024).ToString("0") + " GB" });
+
+            string cpuName = ""; int logical = 0;
+            try
+            {
+                using (System.Management.ManagementObjectSearcher se =
+                    new System.Management.ManagementObjectSearcher("SELECT Name, NumberOfLogicalProcessors FROM Win32_Processor"))
+                {
+                    foreach (System.Management.ManagementBaseObject o in se.Get())
+                    {
+                        cpuName = Convert.ToString(o["Name"]);
+                        logical += Convert.ToInt32(o["NumberOfLogicalProcessors"]);
+                    }
+                }
+            }
+            catch { }
+            r.Add(new string[] { "CPU", cpuName });
+            if (logical > 0) r.Add(new string[] { "逻辑处理器", logical.ToString() + " 个" });
+            r.Add(new string[] { "内核追踪", "ETW PerfInfo (DPC / ISR / ImageLoad)" });
+
+            _sysInfoRows = r;
+            return r;
+        }
+
+        private static List<string[]> _sysInfoRows;
 
         /// <summary>对给定尖峰序列做周期性分析（UI 与导出共用）。</summary>
         public static PeriodResult AnalyzePeriods(List<SpikeRec> list)
@@ -1568,25 +2005,40 @@ namespace ALP2
             Random rnd = new Random(20260927);
             lock (_statLock)
             {
-                _spikes.Clear();
+                _dpc.Clear(); _isr.Clear(); _spikes.Clear();
+                _dpcTotalUs = 0; _isrTotalUs = 0;
+                for (int i = 0; i < _dpcBuckets.Length; i++) { _dpcBuckets[i] = 0; _isrBuckets[i] = 0; }
                 for (int b = 0; b < bursts; b++)
                 {
                     double start = b * periodSec;
                     for (int k = 0; k < perBurst; k++)
                     {
-                        SpikeRec r = new SpikeRec();
-                        r.Driver = "ntoskrnl.exe";
-                        r.Where = "ntoskrnl.exe+0x" + rnd.Next(0x100000, 0x900000).ToString("x");
-                        r.Type = "DPC";
-                        r.Us = 500 + rnd.NextDouble() * 160;
-                        r.AtSec = start + k * 1.1 + rnd.NextDouble() * 0.15;   // 阵内约 1.1 秒一个
-                        r.T = DateTime.Now.AddSeconds(r.AtSec - bursts * periodSec);
-                        _spikes.Add(r);
+                        // 同时喂驱动表与每核心统计，让报告的每个章节都有数据可核对
+                        int cpu = rnd.Next(0, Math.Max(1, Environment.ProcessorCount));
+                        string drv = "ntoskrnl.exe";
+                        string where = "ntoskrnl.exe+0x" + rnd.Next(0x100000, 0x900000).ToString("x");
+                        double us = 500 + rnd.NextDouble() * 160;
+                        double t = start + k * 1.1 + rnd.NextDouble() * 0.15;   // 阵内约 1.1 秒一个
+                        RecordSample(_dpc, drv, where, "DPC", us, cpu, t);
+
+                        // 阵内再塞几条其它驱动的样本，让排行/分档更接近真实形态
+                        if (k % 8 == 3)
+                            RecordSample(_dpc, "nvlddmkm.sys", "nvlddmkm.sys+0x" + rnd.Next(0x10000, 0x90000).ToString("x"),
+                                "DPC", 380 + rnd.NextDouble() * 260, cpu, t);
+                        if (k % 11 == 5)
+                            RecordSample(_isr, "ndis.sys", "ndis.sys+0x" + rnd.Next(0x10000, 0x50000).ToString("x"),
+                                "ISR", 120 + rnd.NextDouble() * 620, cpu, t);
+                        if (k % 13 == 7)
+                            RecordSample(_dpc, "dxgkrnl.sys", "dxgkrnl.sys+0x" + rnd.Next(0x20000, 0x80000).ToString("x"),
+                                "DPC", 240 + rnd.NextDouble() * 300, cpu, t);
                     }
                 }
-                for (int i = 1; i < _spikes.Count; i++)
-                    _spikes[i].SincePrevMs = (_spikes[i].AtSec - _spikes[i - 1].AtSec) * 1000.0;
-                _spikeCount = _spikes.Count;
+                for (int i = 0; i < _spikes.Count; i++)
+                {
+                    // 合成样本的时间轴是虚拟的，把可读时间与间隔都对齐过去
+                    _spikes[i].T = DateTime.Now.AddSeconds(_spikes[i].AtSec - bursts * periodSec);
+                    if (i > 0) _spikes[i].SincePrevMs = (_spikes[i].AtSec - _spikes[i - 1].AtSec) * 1000.0;
+                }
             }
         }
 
@@ -1601,8 +2053,14 @@ namespace ALP2
             {
                 _dpc.Clear(); _isr.Clear(); _spikes.Clear();
                 _dpcCountAtLast[0] = 0; _dpcCountAtLast[1] = 0;
+                for (int i = 0; i < _dpcCpu.Length; i++) _dpcCpu[i] = null;
+                for (int i = 0; i < _isrCpu.Length; i++) _isrCpu[i] = null;
+                for (int i = 0; i < _dpcBuckets.Length; i++) _dpcBuckets[i] = 0;
+                for (int i = 0; i < _isrBuckets.Length; i++) _isrBuckets[i] = 0;
+                _dpcTotalUs = 0; _isrTotalUs = 0;
             }
             _spikeCount = 0;
+            _lastSpikeTs = 0;
             Write("statistics reset", LogLevel.Info);
         }
 

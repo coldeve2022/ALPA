@@ -86,6 +86,13 @@ namespace ALP2
             }
         }
 
+        /// <summary>滚轮只发给有焦点的控件；表不抢焦点，所以在页面这一层转发。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (_table.Bounds.Contains(_table.PointToClient(Cursor.Position))) _table.Wheel(e.Delta);
+            base.OnMouseWheel(e);
+        }
+
         private List<ProcRow> _last = new List<ProcRow>();
 
         public override void OnSample(Snapshot s)
@@ -383,6 +390,13 @@ namespace ALP2
         }
 
         private bool _loaded;
+
+        /// <summary>滚轮只发给有焦点的控件；表不抢焦点，所以在页面这一层转发。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (_table.Bounds.Contains(_table.PointToClient(Cursor.Position))) _table.Wheel(e.Delta);
+            base.OnMouseWheel(e);
+        }
 
         public override void OnSample(Snapshot s)
         {
