@@ -108,7 +108,13 @@ namespace ALP2
             for (int i = 0; i < _b.Length; i++)
             {
                 acc += _b[i];
-                if (acc >= target) return Edges[Math.Min(i, Edges.Length - 1)];
+                if (acc >= target)
+                {
+                    // 分桶返回的是桶的上界，可能大于实际观测到的最大值 ——
+                    // 不夹一下就会出现「P99 315.5 > Max 264.4」这种自相矛盾的数字
+                    double e = Edges[Math.Min(i, Edges.Length - 1)];
+                    return e > _max ? _max : e;
+                }
             }
             return _max;
         }
@@ -275,7 +281,9 @@ namespace ALP2
         private readonly Dictionary<string, DriverStat> _isr = new Dictionary<string, DriverStat>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<ulong, string> _modMap = new Dictionary<ulong, string>();
         private readonly List<SpikeRec> _spikes = new List<SpikeRec>();
-        private const int MaxSpikes = 600;
+        // 600 条会被一阵密集尖峰冲满（实测：中位间隔 1.4ms 时，600 条只覆盖一两秒），
+        // 那样长周期分析就没数据可用了。放宽到 4000，并在报告里写上实际覆盖的时间跨度。
+        private const int MaxSpikes = 4000;
 
         private TraceEventSession _session;
         private Thread _traceThread;
@@ -1278,14 +1286,31 @@ namespace ALP2
                 if (PowerGetActiveScheme(IntPtr.Zero, out g) == 0)
                 {
                     Guid guid = (Guid)Marshal.PtrToStructure(g, typeof(Guid));
-                    string name = guid == new Guid("e9a42b02-d5df-448d-aa00-03f14749eb61") ? "卓越性能"
-                        : guid == new Guid("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c") ? "高性能"
-                        : guid == new Guid("381b4222-f694-41f0-9685-ff5bb260df2e") ? "平衡"
-                        : guid == new Guid("a1841308-3541-4fab-bc81-f71556f20b4a") ? "节能"
-                        : "其他/自定义";
-                    Sev sv = name == "卓越性能" || name == "高性能" ? Sev.Ok : (name == "平衡" ? Sev.Info : Sev.Warn);
+                    // 直接读方案的友好名：只认内置 GUID 的话，用户/工具复制出来的
+                    // 「卓越性能」副本（GUID 不同）会被误报成「其他/自定义」并给出错误建议
+                    string name = FriendlyPowerPlan(guid);
+                    string low = name.ToLowerInvariant();
+                    Sev sv;
+                    string hint;
+                    if (low.Contains("卓越") || low.Contains("ultimate") || low.Contains("高性能")
+                        || low.Contains("high performance") || name.IndexOf("高性能") >= 0)
+                    {
+                        sv = Sev.Ok; hint = "适合做延迟测试";
+                    }
+                    else if (low.Contains("节能") || low.Contains("power saver") || low.Contains("省电"))
+                    {
+                        sv = Sev.Warn; hint = "节能方案会主动降频/降中断响应，测延迟与游戏前建议切到「高性能」或「卓越性能」";
+                    }
+                    else if (low.Contains("平衡") || low.Contains("balanced"))
+                    {
+                        sv = Sev.Info; hint = "平衡方案在部分平台会激进降频；测延迟时建议切到「高性能」或「卓越性能」";
+                    }
+                    else
+                    {
+                        sv = Sev.Info; hint = "自定义电源方案，无法自动判定；请确认它是基于「高性能」还是「平衡」";
+                    }
                     Add(list, "电源与性能", "当前电源计划", name, sv,
-                        sv == Sev.Ok ? "适合做延迟测试" : "做延迟基准测试建议切到「高性能」或「卓越性能」");
+                        hint + "（方案 GUID " + guid.ToString() + "）");
                 }
             }
             catch { }
@@ -1380,6 +1405,31 @@ namespace ALP2
 
             lock (_statLock) { _checks.Clear(); _checks.AddRange(list); }
             Write("system checks complete (" + list.Count + " items)", LogLevel.Info);
+        }
+
+        [DllImport("powrprof.dll", CharSet = CharSet.Unicode)]
+        private static extern uint PowerReadFriendlyName(IntPtr rootPowerKey, ref Guid schemeGuid,
+            IntPtr subGroupGuid, IntPtr powerSettingGuid, byte[] buffer, ref uint bufferSize);
+
+        /// <summary>读电源方案的友好名（失败时退回内置 GUID 映射）。</summary>
+        private static string FriendlyPowerPlan(Guid guid)
+        {
+            try
+            {
+                uint size = 512;
+                byte[] buf = new byte[size];
+                if (PowerReadFriendlyName(IntPtr.Zero, ref guid, IntPtr.Zero, IntPtr.Zero, buf, ref size) == 0)
+                {
+                    string s = Encoding.Unicode.GetString(buf, 0, (int)Math.Max(0, Math.Min(size, (uint)buf.Length) - 2)).Trim();
+                    if (s.Length > 0) return s;
+                }
+            }
+            catch { }
+            if (guid == new Guid("e9a42b02-d5df-448d-aa00-03f14749eb61")) return "卓越性能";
+            if (guid == new Guid("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c")) return "高性能";
+            if (guid == new Guid("381b4222-f694-41f0-9685-ff5bb260df2e")) return "平衡";
+            if (guid == new Guid("a1841308-3541-4fab-bc81-f71556f20b4a")) return "节能";
+            return "其他/自定义";
         }
 
         public List<CheckItem> Checks
@@ -1508,7 +1558,7 @@ namespace ALP2
         public string ExportDriversCsv(string dir)
         {
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("Driver;Type;Count;Current(us);Avg(us);P50(us);P95(us);P99(us);Max(us)");
+            sb.AppendLine(CsvLine("Driver", "Type", "Count", "Current(us)", "Avg(us)", "P50(us)", "P95(us)", "P99(us)", "Max(us)"));
             lock (_statLock)
             {
                 Append(sb, _dpc);
@@ -1669,26 +1719,32 @@ namespace ALP2
             Ruler(sb, '_');
             PeriodResult pr = AnalyzePeriods(spikes);
             sb.AppendLine("尖峰总数: " + spikes.Count.ToString("#,0"));
+            if (spikes.Count > 1)
+            {
+                double span = spikes[spikes.Count - 1].AtSec - spikes[0].AtSec;
+                sb.AppendLine("缓冲覆盖: " + FmtMs(span * 1000)
+                    + (spikes.Count >= MaxSpikes ? "（已达 " + MaxSpikes + " 条上限，更早的尖峰已被丢弃）" : "（全部尖峰）"));
+            }
             sb.AppendLine("周期判定: " + (pr == null ? "样本不足或未发现固定间隔" : pr.Describe()));
             double med, mn, mx;
             IntervalStatsOf(spikes, out med, out mn, out mx);
             if (med > 0)
+                sb.AppendLine("相邻间隔: 中位 " + FmtMs(med) + " ; 最小 " + FmtMs(mn) + " ; 最大 " + FmtMs(mx)
+                    + "（中位远小于最大值 = 成阵出现：阵内密、阵间疏）");
+
+            List<double> burstAt = BurstStarts(spikes, med);
+            if (burstAt.Count > 0)
             {
-                sb.AppendLine("相邻间隔: 中位 " + FmtMs(med) + " ; 最小 " + FmtMs(mn) + " ; 最大 " + FmtMs(mx));
-                sb.AppendLine("         （若中位远小于周期，说明尖峰是成阵出现的，阵内密、阵间疏）");
-            }
-            // 每一“阵”的起始时间：与上一个尖峰间隔超过 1/10 周期就算新阵
-            if (pr != null && spikes.Count > 3)
-            {
-                List<DateTime> starts = new List<DateTime>();
-                double gap = Math.Max(0.5, pr.PeriodSec * 0.25);
-                for (int i = 0; i < spikes.Count; i++)
+                double thSec = Math.Max(30.0, med / 1000.0 * 20.0);
+                sb.AppendLine("成阵情况: 共 " + burstAt.Count + " 个阵（相邻间隔 > " + FmtMs(thSec * 1000) + " 视为分阵）");
+                if (burstAt.Count >= 2)
                 {
-                    double prev = i == 0 ? 1e9 : (spikes[i].AtSec - spikes[i - 1].AtSec);
-                    if (prev > gap) starts.Add(spikes[i].T);
+                    List<double> gaps = new List<double>();
+                    for (int i = 1; i < burstAt.Count; i++) gaps.Add((burstAt[i] - burstAt[i - 1]) * 1000.0);
+                    gaps.Sort();
+                    sb.AppendLine("阵间间隔: 中位 " + FmtMs(gaps[gaps.Count / 2]) + " ; 最小 " + FmtMs(gaps[0])
+                        + " ; 最大 " + FmtMs(gaps[gaps.Count - 1]) + "   <- 「多久来一批」看这一行");
                 }
-                sb.AppendLine("检测到 " + starts.Count + " 个阵，起始时间:");
-                foreach (DateTime t in starts) sb.AppendLine("    " + t.ToString("yyyy-MM-dd HH:mm:ss"));
             }
             sb.AppendLine();
 
@@ -1755,6 +1811,26 @@ namespace ALP2
             File.WriteAllText(f, sb.ToString(), new UTF8Encoding(true));
             Write("report exported: " + f, LogLevel.Ok);
             return f;
+        }
+
+        /// <summary>
+        /// 把尖峰按「阵」聚类，返回每个阵的起始时刻（秒）。
+        ///
+        /// 阈值取自相邻间隔中位的 20 倍、且不小于 30 秒 —— 这一步很关键：
+        /// 相位折叠给出的细周期是「阵内间隔」（实测 1.5 秒），如果拿它当分阵阈值，
+        /// 一个阵会被切成几十个假阵；用自适应的大阈值才能得到真正的「多久来一批」。
+        /// </summary>
+        private static List<double> BurstStarts(List<SpikeRec> spikes, double medianGapMs)
+        {
+            List<double> starts = new List<double>();
+            if (spikes == null || spikes.Count < 4) return starts;
+            double thSec = Math.Max(30.0, medianGapMs / 1000.0 * 20.0);
+            for (int i = 0; i < spikes.Count; i++)
+            {
+                double prev = i == 0 ? double.MaxValue : (spikes[i].AtSec - spikes[i - 1].AtSec);
+                if (prev > thSec) starts.Add(spikes[i].AtSec);
+            }
+            return starts;
         }
 
         private static void Ruler(StringBuilder sb, char ch)
@@ -1868,9 +1944,25 @@ namespace ALP2
             }
 
             PeriodResult pr = AnalyzePeriods(spikes);
+
+            // 尖峰成阵出现时，用户真正想知道的是「多久来一批」——单独算并写进结论
+            double gmed, gmin, gmax;
+            IntervalStatsOf(spikes, out gmed, out gmin, out gmax);
+            List<double> bursts = BurstStarts(spikes, gmed);
+            if (bursts.Count >= 3)
+            {
+                List<double> bg = new List<double>();
+                for (int i = 1; i < bursts.Count; i++) bg.Add((bursts[i] - bursts[i - 1]) * 1000.0);
+                bg.Sort();
+                double bm = bg[bg.Count / 2];
+                c.Add("尖峰成批出现：共 " + bursts.Count + " 批，批与批之间中位间隔 " + FmtMs(bm)
+                    + "（最小 " + FmtMs(bg[0]) + "、最大 " + FmtMs(bg[bg.Count - 1])
+                    + "）。固定节拍强烈指向某个常驻组件（安全软件心跳、厂商服务、监控代理）或设备周期性任务，"
+                    + "而不是随机负载。");
+            }
             if (pr != null && pr.Cycles >= 2)
-                c.Add("尖峰呈固定周期出现（" + pr.Describe() + "）。周期性强烈指向某个按固定节拍运行的常驻组件"
-                    + "（安全软件心跳、厂商服务、监控代理），而不是随机负载。");
+                c.Add("批内尖峰呈规律间隔（" + pr.Describe() + "）；若批内间隔远小于批间间隔，"
+                    + "说明触发源在一段时间内连续工作，而不是单次事件。");
 
             if (timerMs > 1.001)
                 c.Add("系统定时器精度为 " + timerMs.ToString("0.####") + " ms（未锁到 1 ms）。低延迟场景可由程序调用 timeBeginPeriod(1) 锁定。");
