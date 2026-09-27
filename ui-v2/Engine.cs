@@ -390,6 +390,14 @@ namespace ALP2
                 Write("trace library unavailable - DPC/ISR tracing disabled"
                     + (string.IsNullOrEmpty(traceErr) ? "" : " (" + traceErr + ")"), LogLevel.Crit);
 
+            // 原生依赖（KernelTraceControl.dll 等）能不能落盘并可加载。
+            // 这一步不需要管理员权限，所以「为什么会没数据」在提权之前就能看出线索。
+            string pre = Boot.Preflight();
+            if (pre.StartsWith("ok"))
+                Write("native preflight " + pre, LogLevel.Ok);
+            else
+                Write("native preflight " + pre, LogLevel.Crit);
+
             // 2) 计数器
             InitCounters();
 
@@ -418,6 +426,44 @@ namespace ALP2
         private volatile bool _bootDone;
 
         public bool BootScanDone { get { return _bootDone; } }
+
+        /// <summary>
+        /// 只重启内核追踪线程，不碰引擎其它部分。UI 上「重试追踪」按钮用。
+        /// 典型场景：启动时那次会话创建和别人抢了（比如同时开着别的延迟监控工具），
+        /// 对方退出后重试就能成功，不用重启整个程序。
+        /// </summary>
+        public void RetryTracing()
+        {
+            try
+            {
+                TraceEventSession s = _session;
+                _session = null;
+                if (s != null) { try { s.Dispose(); } catch { } }
+            }
+            catch { }
+            _traceError = null;
+            if (IsAdmin) StartTracing();
+            else Write("retry tracing skipped - not elevated", LogLevel.Warn);
+        }
+
+        /// <summary>手动停掉内核会话（不改动 _running，仅追踪层）。</summary>
+        private void StopTracingSession()
+        {
+            TraceEventSession s = _session;
+            _session = null;
+            if (s != null) { try { s.Dispose(); } catch { } }
+            try
+            {
+                foreach (string name in TraceEventSession.GetActiveSessionNames())
+                {
+                    if (name == "NT Kernel Logger")
+                    {
+                        using (TraceEventSession k = new TraceEventSession(name)) k.Stop(true);
+                    }
+                }
+            }
+            catch { }
+        }
 
         public void Stop()
         {
@@ -592,11 +638,18 @@ namespace ALP2
                     };
 
                     Write("ALPA v2 engine LIVE - kernel DPC/ISR tracing active", LogLevel.Ok);
+                    WriteNativeState();
+                    _traceError = null;
                     session.Source.Process();
                 }
                 catch (Exception ex)
                 {
-                    Write("kernel tracing error: " + ex.Message, LogLevel.Crit);
+                    // 只记 ex.Message 是不够的（一句「路径中具有非法字符」根本定位不到原因），
+                    // 把类型、内部异常和堆栈前几帧一起写进日志。
+                    _traceError = Short(ex);
+                    Write("kernel tracing error: " + Short(ex), LogLevel.Crit);
+                    Write("kernel tracing detail: " + Verbose(ex), LogLevel.Muted);
+                    WriteNativeState();
                     _session = null;
                 }
             });
@@ -605,9 +658,57 @@ namespace ALP2
             _traceThread.Start();
         }
 
-        private void LoadDriverList()
+        /// <summary>
+        /// 内核追踪失败的原因（null = 正常）。UI 直接拿它挂提示条，
+        /// 别再让用户对着空白的曲线猜「为什么没数据」。
+        /// </summary>
+        private volatile string _traceError;
+
+        public string TraceError { get { return _traceError; } }
+
+        /// <summary>一句话版本的异常描述（给 UI 用）。</summary>
+        private static string Short(Exception ex)
         {
-            try
+            string m = ex.Message;
+            if (m != null && m.EndsWith("。")) m = m.Substring(0, m.Length - 1);
+            Exception inner = ex.InnerException;
+            if (inner != null) m += " / " + inner.Message;
+            return ex.GetType().Name + ": " + m;
+        }
+
+        /// <summary>带堆栈的详细描述（给日志用）。</summary>
+        private static string Verbose(Exception ex)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.Append(ex.GetType().FullName).Append(": ").Append(ex.Message);
+            System.ComponentModel.Win32Exception w = ex as System.ComponentModel.Win32Exception;
+            if (w != null) sb.Append(" [Win32=").Append(w.NativeErrorCode).Append(']');
+            if (ex.InnerException != null) sb.Append(" <<inner: ").Append(ex.InnerException.Message).Append(">>");
+            if (!string.IsNullOrEmpty(ex.StackTrace))
+            {
+                string[] lines = ex.StackTrace.Split('\n');
+                for (int i = 0; i < lines.Length && i < 6; i++)
+                    sb.Append(" | ").Append(lines[i].Trim());
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 记录原生依赖（KernelTraceControl.dll 等）的解包状态。
+        /// 单文件版里它必须真的落盘，否则内核会话一定起不来 —— 这是排查空数据的第一个看点。
+        /// </summary>
+        private void WriteNativeState()
+        {
+            if (Boot.StageError != null)
+                Write("native payload stage FAILED: " + Boot.StageError, LogLevel.Crit);
+            else if (Boot.Staged)
+                Write("native payload staged: " + Boot.StageDir, LogLevel.Muted);
+            else
+                Write("native payload never requested (OSExtensions not loaded)", LogLevel.Warn);
+        }
+
+        private void LoadDriverList()
+        {            try
             {
                 uint needed;
                 IntPtr[] addr = new IntPtr[2048];

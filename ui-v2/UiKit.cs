@@ -770,13 +770,14 @@ namespace ALP2
         }
     }
 
-    /// <summary>顶部提示条（例如「未提权，内核追踪不可用」）。</summary>
+    /// <summary>顶部提示条（例如「未提权，内核追踪不可用」）。最多带两个操作按钮。</summary>
     internal class Banner : SkinnedControl
     {
         public string TitleText = "";
         public string BodyText = "";
         public Sev Sev = Sev.Warn;
         public FlatButton Action;
+        public FlatButton Action2;
 
         public Banner()
         {
@@ -786,8 +787,14 @@ namespace ALP2
 
         public void Set(string title, string body, Sev sev, string actionText)
         {
+            Set(title, body, sev, actionText, null);
+        }
+
+        public void Set(string title, string body, Sev sev, string actionText, string action2Text)
+        {
             TitleText = title; BodyText = body; Sev = sev;
             if (Action != null) { Controls.Remove(Action); Action.Dispose(); Action = null; }
+            if (Action2 != null) { Controls.Remove(Action2); Action2.Dispose(); Action2 = null; }
             if (!string.IsNullOrEmpty(actionText))
             {
                 Action = new FlatButton();
@@ -797,16 +804,38 @@ namespace ALP2
                 Action.Width = Theme.Px(142);
                 Controls.Add(Action);
             }
+            if (!string.IsNullOrEmpty(action2Text))
+            {
+                Action2 = new FlatButton();
+                Action2.Kind = BtnKind.Ghost;
+                Action2.Text2 = action2Text;
+                Action2.Height = Theme.Px(28);
+                Action2.Width = Theme.Px(110);
+                Controls.Add(Action2);
+            }
+            LayoutActions();
             Invalidate();
         }
 
         protected override void OnResize(EventArgs e)
         {
+            LayoutActions();
+            base.OnResize(e);
+        }
+
+        private void LayoutActions()
+        {
+            int x = Width - Theme.Px(12);
             if (Action != null)
             {
-                Action.SetBounds(Width - Action.Width - Theme.Px(12), (Height - Action.Height) / 2, Action.Width, Action.Height);
+                Action.SetBounds(x - Action.Width, (Height - Action.Height) / 2, Action.Width, Action.Height);
+                x -= Action.Width + Theme.Px(8);
             }
-            base.OnResize(e);
+            if (Action2 != null)
+            {
+                Action2.SetBounds(x - Action2.Width, (Height - Action2.Height) / 2, Action2.Width, Action2.Height);
+                x -= Action2.Width + Theme.Px(8);
+            }
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -824,7 +853,9 @@ namespace ALP2
             Font ft = Theme.F(9f, FontStyle.Bold);
             Font fb = Theme.F(8.4f, FontStyle.Regular);
             int x = Theme.Px(14) + isz + Theme.Px(9);
-            int right = (Action != null ? Action.Width + Theme.Px(24) : Theme.Px(14));
+            int right = Theme.Px(14);
+            if (Action != null) right += Action.Width + Theme.Px(8);
+            if (Action2 != null) right += Action2.Width + Theme.Px(8);
             int w = Math.Max(Theme.Px(40), Width - x - right);
 
             // 标题 + 正文整体垂直居中，避免底部被圆角边框切掉半行字

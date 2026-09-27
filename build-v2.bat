@@ -11,8 +11,12 @@ rem    两者可以并存。这个脚本只是给没有 .NET SDK 的机器用的
 rem    有 SDK 的话直接  dotnet build ui-v2\ALPA.V2.csproj -c Release
 rem    （产物在 ui-v2\build\ALPA_v2.exe，复制到根目录即可）。
 rem
-rem    4 个依赖 DLL 以【嵌入资源】形式打进 exe，由 ui-v2\Embedded.cs 在运行时解出加载，
-rem    所以不需要把它们跟 exe 放在一起。下面 /resource: 那几行就是塞进去的动作。
+rem    依赖以【嵌入资源】形式打进 exe，运行时由 ui-v2\Embedded.cs 取出：
+rem      · 纯托管依赖（TraceEvent 等）直接从内存加载
+rem      · OSExtensions.dll 必须解包到磁盘再 LoadFrom —— 它要靠原生
+rem        KernelTraceControl.dll 才能启动内核会话，从内存加载时
+rem        Assembly.Location 为空，追踪会失败并报「路径中具有非法字符」
+rem    所以下面 /resource: 既包含托管 DLL，也包含 amd64\ 下的原生文件。
 rem ===========================================================================
 setlocal
 
@@ -50,6 +54,11 @@ echo [*] 编译 ui-v2 ...
   /resource:"System.Runtime.CompilerServices.Unsafe.dll",System.Runtime.CompilerServices.Unsafe.dll ^
   /resource:"Dia2Lib.dll",Dia2Lib.dll ^
   /resource:"TraceReloggerLib.dll",TraceReloggerLib.dll ^
+  /resource:"amd64\KernelTraceControl.dll",native_amd64_KernelTraceControl.dll ^
+  /resource:"amd64\msdia140.dll",native_amd64_msdia140.dll ^
+  /resource:"amd64\msvcp140.dll",native_amd64_msvcp140.dll ^
+  /resource:"amd64\vcruntime140.dll",native_amd64_vcruntime140.dll ^
+  /resource:"amd64\vcruntime140_1.dll",native_amd64_vcruntime140_1.dll ^
   ui-v2\*.cs
 
 if errorlevel 1 (

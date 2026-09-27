@@ -23,12 +23,21 @@ EXTRA = sys.argv[4].split() if len(sys.argv) > 4 else []
 TITLE_KEY = "ALPA v2"
 
 
-def find_window():
+def find_window(pid):
+    """只找**本进程启动的那个**窗口。
+
+    早先按标题子串匹配，结果抓到过编辑器窗口（它的标题里也含项目路径），
+    拍出来是代码界面而不是程序界面。按 PID 匹配才是可靠的。
+    """
     found = []
 
     @ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
     def cb(hwnd, lparam):
         if not user32.IsWindowVisible(hwnd):
+            return True
+        wpid = wt.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if wpid.value != pid:
             return True
         n = user32.GetWindowTextLengthW(hwnd)
         if n <= 0:
@@ -54,7 +63,7 @@ for page in PAGES:
     hwnd = 0
     for _ in range(60):
         time.sleep(1)
-        wins = find_window()
+        wins = find_window(proc.pid)
         if wins:
             r = wt.RECT()
             user32.GetWindowRect(wins[0], ctypes.byref(r))
@@ -66,11 +75,16 @@ for page in PAGES:
         print("  NOT_FOUND", flush=True)
         proc.terminate()
         continue
-    # 置前：机器上可能同时跑着原版 ALPA，不置前会拍到「被别的窗口压住」的图
+    # 置前。注意：只调 SetForegroundWindow 会被系统拒绝（前台程序有优先权），
+    # 结果拍到的是压在它上面的别的窗口（实测抓到过编辑器界面）。
+    # 直接置顶（HWND_TOPMOST）才可靠，抓完再取消置顶。
+    HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+    SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
     try:
         user32.ShowWindow(hwnd, 9)          # SW_RESTORE
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
         user32.SetForegroundWindow(hwnd)
-        user32.BringWindowToTop(hwnd)
     except Exception:
         pass
     time.sleep(3)   # 再给界面几秒把首个采样画上去
@@ -84,6 +98,11 @@ for page in PAGES:
     img = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True)
     img.save(out)
     print("  saved", out, img.size, flush=True)
+    try:
+        user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                            SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
+    except Exception:
+        pass
 
     proc.terminate()
     try:

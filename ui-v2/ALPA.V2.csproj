@@ -28,9 +28,9 @@
     <AssemblyTitle>ALPA v2 - Latency &amp; DPC Audit</AssemblyTitle>
     <Product>ALPA v2</Product>
     <Description>Readable light-theme UI rework of ALPA (Amazing Latency Performance Audit).</Description>
-    <Version>2.0.0</Version>
-    <FileVersion>2.0.0.0</FileVersion>
-    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <Version>2.0.1</Version>
+    <FileVersion>2.0.1.0</FileVersion>
+    <AssemblyVersion>2.0.1.0</AssemblyVersion>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <NoWarn>$(NoWarn);CS0649;CS0169;CS1591</NoWarn>
@@ -81,9 +81,17 @@
   </ItemGroup>
 
   <!--
-    单文件发布：把依赖 DLL 作为嵌入资源打进 exe，由 Embedded.cs 里的 Boot 在运行时解出加载。
-    LogicalName 必须显式指定成「简单名 + .dll」，否则会被加上 RootNamespace 前缀，
-    运行时按名字找不到。这样 ALPA_v2.exe 就能单独运行，不需要旁边放任何 DLL。
+    单文件发布：把依赖作为嵌入资源打进 exe，由 Embedded.cs 里的 Boot 在运行时取出。
+
+    分两类处理（这一点踩过大坑）：
+      · 纯托管依赖 → 直接从内存 Assembly.Load(byte[])
+      · OSExtensions.dll → 必须解包到磁盘再 Assembly.LoadFrom。
+        它要靠原生 KernelTraceControl.dll 才能启动内核会话，从内存加载时
+        Assembly.Location 是空字符串，拼不出 amd64\ 路径，追踪会直接失败
+        （报「路径中具有非法字符」），所以原生 amd64\ 整包也要一起嵌入。
+
+    LogicalName 必须显式指定，否则会被加上 RootNamespace 前缀，运行时按名字找不到。
+    原生文件用 native_amd64_ 前缀，解包时映射到 amd64\ 子目录。
   -->
   <ItemGroup>
     <EmbeddedResource Include="..\Microsoft.Diagnostics.Tracing.TraceEvent.dll">
@@ -103,6 +111,23 @@
     </EmbeddedResource>
     <EmbeddedResource Include="..\TraceReloggerLib.dll">
       <LogicalName>TraceReloggerLib.dll</LogicalName>
+    </EmbeddedResource>
+
+    <!-- 原生：内核会话必需，缺一个就会「空白」 -->
+    <EmbeddedResource Include="..\amd64\KernelTraceControl.dll">
+      <LogicalName>native_amd64_KernelTraceControl.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\amd64\msdia140.dll">
+      <LogicalName>native_amd64_msdia140.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\amd64\msvcp140.dll">
+      <LogicalName>native_amd64_msvcp140.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\amd64\vcruntime140.dll">
+      <LogicalName>native_amd64_vcruntime140.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\amd64\vcruntime140_1.dll">
+      <LogicalName>native_amd64_vcruntime140_1.dll</LogicalName>
     </EmbeddedResource>
   </ItemGroup>
 

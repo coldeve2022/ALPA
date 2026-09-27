@@ -173,7 +173,8 @@ namespace ALP2
 
             _top.Title = "ALPA";
             _top.Sub = "延迟与 DPC 审计 · Latency & DPC Audit";
-            _top.Version = "v2.0";
+            try { _top.Version = "v" + System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(3); }
+            catch { _top.Version = "v2"; }
             Controls.Add(_top);
             Controls.Add(_side);
             Controls.Add(_status);
@@ -245,7 +246,14 @@ namespace ALP2
 
             _timer = new System.Windows.Forms.Timer();
             _timer.Interval = 1000;
-            _timer.Tick += delegate { _eng.FlushMouseRate(); UpdateStatus(); };
+            _timer.Tick += delegate
+            {
+                _eng.FlushMouseRate();
+                UpdateStatus();
+                // 提示条不能只在「采样到达时」更新：引擎/追踪失败可能早于首次采样，
+                // 那样用户会先盯着一片空白好几秒才看到原因。这里每秒复查一次。
+                UpdateBanner(null);
+            };
             _timer.Start();
 
             Shown += delegate
@@ -258,6 +266,8 @@ namespace ALP2
                     + " (dpi " + Program.DpiScale.ToString("0.##", CultureInfo.InvariantCulture)
                     + " x fit " + Program.FitScale.ToString("0.###", CultureInfo.InvariantCulture) + ")",
                     LogLevel.Muted);
+                // 界面一出来就先给结论（有没有权限），别让空白先出现
+                UpdateBanner(null);
                 SyncRunButton();
             };
 
@@ -320,23 +330,55 @@ namespace ALP2
         }
 
         private bool _bannerShown;
+        private string _bannerKey = "";
 
+        /// <summary>
+        /// 提示条有且只有三种状态：① 没提权；② 提权了但内核追踪没起来（把原因直接摆给用户看）；
+        /// ③ 一切正常则不显示。用 key 去重，避免每秒重建按钮。
+        /// </summary>
         private void UpdateBanner(Snapshot s)
         {
-            bool need = !_eng.IsAdmin;
-            if (need != _bannerShown)
+            string key;
+            if (!_eng.IsAdmin) key = "no-admin";
+            else if (!string.IsNullOrEmpty(_eng.TraceError)) key = "trace:" + _eng.TraceError;
+            else key = "";
+
+            if (key == _bannerKey) return;
+            _bannerKey = key;
+            _bannerShown = key.Length > 0;
+
+            if (!_bannerShown)
             {
-                _bannerShown = need;
-                if (need)
-                {
-                    _banner.Set("当前以普通权限运行，内核 DPC / ISR 追踪不可用",
-                        "这一项是整个工具的核心能力，需要管理员权限才能挂载 ETW 内核会话。",
-                        Sev.Warn, "以管理员身份重启");
-                    if (_banner.Action != null) _banner.Action.Click += delegate { Elevate(); };
-                }
-                _banner.Visible = need;
+                _banner.Visible = false;
                 LayoutHost();
+                return;
             }
+
+            if (key == "no-admin")
+            {
+                _banner.Set("当前以普通权限运行，内核 DPC / ISR 追踪不可用",
+                    "这一项是整个工具的核心能力，需要管理员权限才能挂载 ETW 内核会话。",
+                    Sev.Warn, "以管理员身份重启", "查看日志");
+                if (_banner.Action != null) _banner.Action.Click += delegate { Elevate(); };
+            }
+            else
+            {
+                _banner.Set("内核 DPC / ISR 追踪没能启动 —— 这就是延迟数据空白的原因",
+                    "原因：" + _eng.TraceError + "。日志里有完整堆栈；若另一个延迟监控工具正占着内核会话，关掉它再点「重试追踪」。",
+                    Sev.Crit, "重试追踪", "查看日志");
+                if (_banner.Action != null) _banner.Action.Click += delegate { RetryTracing(); };
+            }
+            if (_banner.Action2 != null) _banner.Action2.Click += delegate { SetPage(5); };
+
+            _banner.Visible = true;
+            LayoutHost();
+        }
+
+        private void RetryTracing()
+        {
+            _eng.RetryTracing();
+            _bannerKey = "";          // 强制下一帧重算提示条状态
+            Invalidate();
         }
 
         private int BannerH { get { return _bannerShown ? Theme.Px(58) : 0; } }
