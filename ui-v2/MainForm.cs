@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.Windows.Forms;
 
 // 注意：MainForm 继承自 Form，Form.Icon 这个属性会把 ALP2.Icon 枚举遮蔽掉，
@@ -252,6 +253,11 @@ namespace ALP2
                 _ui.Start();
                 _eng.AttachRawInput(Handle);
                 _eng.Start(Engine.AppDir);
+                // 界面缩放写进日志：出问题时要能一眼看出跑的是哪套 DPI/缩放组合
+                _eng.Write("ui scale " + Theme.S.ToString("0.###", CultureInfo.InvariantCulture)
+                    + " (dpi " + Program.DpiScale.ToString("0.##", CultureInfo.InvariantCulture)
+                    + " x fit " + Program.FitScale.ToString("0.###", CultureInfo.InvariantCulture) + ")",
+                    LogLevel.Muted);
                 SyncRunButton();
             };
 
@@ -525,8 +531,25 @@ namespace ALP2
 
     internal static class Program
     {
+        /// <summary>进程 DPI 缩放（96dpi = 1.0）。启动时测一次。</summary>
+        public static float DpiScale = 1f;
+        /// <summary>屏幕适配系数：设计尺寸装不下时整体等比缩小。</summary>
+        public static float FitScale = 1f;
+
+        /// <summary>
+        /// 入口。只做一件事：先把嵌入依赖的加载器挂上，再进真正的 Main。
+        /// 这个拆分是必须的 —— 本方法体内一旦出现任何依赖 TraceEvent 的类型，
+        /// JIT 会在 AssemblyResolve 注册之前就去加载它，单文件模式直接崩。
+        /// </summary>
         [STAThread]
         private static void Main(string[] args)
+        {
+            Boot.Attach();
+            Run(args);
+        }
+
+        [STAThread]
+        private static void Run(string[] args)
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
@@ -548,10 +571,13 @@ namespace ALP2
             float wantW = 1264f * dpiScale;
             float wantH = 802f * dpiScale;
             float fit = Math.Min(1f, Math.Min((wa.Width - 12f * dpiScale) / wantW, (wa.Height - 12f * dpiScale) / wantH));
+            DpiScale = dpiScale;
+            FitScale = fit;
             Theme.S = Math.Max(0.6f, dpiScale * fit);
 
             bool noElevate = false;
             int startPage = -1;
+            float forcedScale = 0f;
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--no-elevate") noElevate = true;
@@ -560,6 +586,16 @@ namespace ALP2
                     int.TryParse(args[i].Substring(7), out startPage);
                     startPage = Math.Max(0, Math.Min(5, startPage - 1));   // 命令行用 1..6
                 }
+                else if (args[i].StartsWith("--scale=", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 手动指定界面缩放：字太小/太大时用，例如 --scale=1.25
+                    float.TryParse(args[i].Substring(8), NumberStyles.Float, CultureInfo.InvariantCulture, out forcedScale);
+                }
+            }
+            if (forcedScale > 0f)
+            {
+                Theme.S = Math.Max(0.5f, Math.Min(2.5f, forcedScale));
+                FitScale = Theme.S;
             }
 
             if (!Engine.IsElevated() && !noElevate)

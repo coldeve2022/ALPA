@@ -80,4 +80,30 @@
     </Reference>
   </ItemGroup>
 
+  <!--
+    单文件发布：把依赖 DLL 作为嵌入资源打进 exe，由 Embedded.cs 里的 Boot 在运行时解出加载。
+    LogicalName 必须显式指定成「简单名 + .dll」，否则会被加上 RootNamespace 前缀，
+    运行时按名字找不到。这样 ALPA_v2.exe 就能单独运行，不需要旁边放任何 DLL。
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\Microsoft.Diagnostics.Tracing.TraceEvent.dll">
+      <LogicalName>Microsoft.Diagnostics.Tracing.TraceEvent.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\Microsoft.Diagnostics.FastSerialization.dll">
+      <LogicalName>Microsoft.Diagnostics.FastSerialization.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\OSExtensions.dll">
+      <LogicalName>OSExtensions.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\System.Runtime.CompilerServices.Unsafe.dll">
+      <LogicalName>System.Runtime.CompilerServices.Unsafe.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\Dia2Lib.dll">
+      <LogicalName>Dia2Lib.dll</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="..\TraceReloggerLib.dll">
+      <LogicalName>TraceReloggerLib.dll</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
 </Project>

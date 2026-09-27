@@ -134,7 +134,7 @@ namespace ALP2
         public int Pid;
         public string Name = "";
         public int Threads;
-        public string Prio = "Norm";
+        public string Prio = "Normal";
         public int PrioVal = 3;
         public TimeSpan Cpu;
         public double RamMb;
@@ -378,9 +378,17 @@ namespace ALP2
             else
                 Write("ntdll timer API failed", LogLevel.Warn);
 
-            Write(File.Exists("Microsoft.Diagnostics.Tracing.TraceEvent.dll")
-                ? "TraceEvent.dll found"
-                : "TraceEvent.dll missing - DPC/ISR tracing unavailable", File.Exists("Microsoft.Diagnostics.Tracing.TraceEvent.dll") ? LogLevel.Ok : LogLevel.Crit);
+            // 真正去解析一次追踪库，而不是 File.Exists。
+            //   · 单文件版把 DLL 打包在 exe 资源里，磁盘上就没有这个文件，
+            //     用 File.Exists 判断会误报「缺失」，进而把内核追踪整个关掉；
+            //   · 顺带还能拿到版本号，排查问题时比「found」有用得多。
+            string traceErr;
+            string traceId = ProbeTraceLib(out traceErr);
+            if (traceId != null)
+                Write("trace library ready: " + traceId, LogLevel.Ok);
+            else
+                Write("trace library unavailable - DPC/ISR tracing disabled"
+                    + (string.IsNullOrEmpty(traceErr) ? "" : " (" + traceErr + ")"), LogLevel.Crit);
 
             // 2) 计数器
             InitCounters();
@@ -826,6 +834,31 @@ namespace ALP2
 
             lock (_procLock) s.Procs = new List<ProcRow>(_procs);
             return s;
+        }
+
+        /// <summary>
+        /// 尝试真正加载 TraceEvent，成功返回「程序集名 版本 (来源)」。
+        /// Assembly.Load 失败时会走 AppDomain.AssemblyResolve —— 单文件版正是靠
+        /// 那条链路从 exe 内嵌资源里解出来的，所以这个探针同时覆盖两种发布形态。
+        /// </summary>
+        private static string ProbeTraceLib(out string err)
+        {
+            err = null;
+            const string name = "Microsoft.Diagnostics.Tracing.TraceEvent";
+            try
+            {
+                System.Reflection.Assembly a = System.Reflection.Assembly.Load(name);
+                if (a == null) { err = "resolve returned null"; return null; }
+                string where = "embedded";
+                try { if (!string.IsNullOrEmpty(a.Location)) where = "file"; }
+                catch { }
+                return name + " " + a.GetName().Version.ToString() + " (" + where + ")";
+            }
+            catch (Exception ex)
+            {
+                err = ex.GetType().Name;
+                return null;
+            }
         }
 
         private void SampleProcesses()

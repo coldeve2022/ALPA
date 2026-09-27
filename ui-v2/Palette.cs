@@ -308,9 +308,49 @@ namespace ALP2
         private static readonly Dictionary<string, Size> _txtCache = new Dictionary<string, Size>();
         private static readonly object _txtLock = new object();
 
+        private static Graphics _measureDc;
+        private static bool _measureDcTried;
+
+        /// <summary>
+        /// 全局测量用的屏幕 DC。
+        /// 关键：TextRenderer 的**静态** MeasureText 重载内部按系统 DPI(96) 建 DC 测量，
+        /// 而实际绘制走的是窗口 DC（跟随进程 DPI 感知）。在 125% DPI 的机器上
+        /// 「量的」会比「画的」小 25%，于是列宽自适应算出来的宽度照样把 "Normal" 截成 "Norm"。
+        /// 统一用屏幕 DC 测量，量的和画的才是同一套度量。
+        /// </summary>
+        private static Graphics MeasureDc
+        {
+            get
+            {
+                if (!_measureDcTried)
+                {
+                    _measureDcTried = true;
+                    try { _measureDc = Graphics.FromHwnd(IntPtr.Zero); }
+                    catch { _measureDc = null; }
+                }
+                return _measureDc;
+            }
+        }
+
         private static string FontKey(Font f)
         {
             return f.Name + "|" + f.SizeInPoints.ToString("0.###") + "|" + (int)f.Style;
+        }
+
+        private static Size RawMeasure(string s, Font f)
+        {
+            Graphics dc = MeasureDc;
+            if (dc != null)
+            {
+                try
+                {
+                    return TextRenderer.MeasureText(dc, s, f, new Size(int.MaxValue, int.MaxValue),
+                        TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                }
+                catch { }
+            }
+            return TextRenderer.MeasureText(s, f, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         }
 
         /// <summary>
@@ -322,7 +362,6 @@ namespace ALP2
         /// </summary>
         public static Size GdiSize(Graphics g, string s, Font f)
         {
-            if (string.IsNullOrEmpty(s)) return new Size(0, 0);
             string key = "G|" + FontKey(f) + "|" + s;
             lock (_txtLock)
             {
@@ -335,10 +374,7 @@ namespace ALP2
             return r;
         }
 
-        /// <summary>
-        /// 不依赖 Graphics 的 GDI 尺寸测量（静态重载走屏幕 DC）。
-        /// 表格列宽自适应要在 SetRows 阶段算，那时拿不到 PaintEventArgs，用它。
-        /// </summary>
+        /// <summary>不依赖 Graphics 的版本（表格列宽自适应在 SetRows 阶段用）。</summary>
         public static Size GdiSize(string s, Font f)
         {
             if (string.IsNullOrEmpty(s)) return new Size(0, 0);
@@ -348,8 +384,7 @@ namespace ALP2
                 Size v;
                 if (_txtCache.TryGetValue(key, out v)) return v;
             }
-            Size r = TextRenderer.MeasureText(s, f, new Size(int.MaxValue, int.MaxValue),
-                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            Size r = RawMeasure(s, f);
             Store(key, r);
             return r;
         }
@@ -363,8 +398,7 @@ namespace ALP2
                 Size v;
                 if (_txtCache.TryGetValue(key, out v)) return v.Height;
             }
-            Size r = TextRenderer.MeasureText("国Ag", f, new Size(int.MaxValue, int.MaxValue),
-                TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+            Size r = RawMeasure("国Ag", f);
             Store(key, r);
             return r.Height;
         }
@@ -410,18 +444,17 @@ namespace ALP2
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
         }
 
+        /// <summary>
+        /// 一行文字的实测宽度。刻意和「绘制」用同一套度量（含 GDI 内边距）。
+        ///
+        /// 这里踩过一次：原来用 NoPadding 量、绘制却带内边距，两者正好差 6px，
+        /// 于是「按测量值给宽度、再用这个宽度去画」处处差一点点，
+        /// 表现为「12.5 GB / 32.9 …」「其他/自…」这种看着明明快放得下却被截断的结果。
+        /// 量的和画的是同一套度量，这类问题才会整体消失。
+        /// </summary>
         public static Size Measure(string s, Font f)
         {
-            if (string.IsNullOrEmpty(s)) return new Size(0, 0);
-            string key = "M|" + FontKey(f) + "|" + s;
-            lock (_txtLock)
-            {
-                Size v;
-                if (_txtCache.TryGetValue(key, out v)) return v;
-            }
-            Size r = TextRenderer.MeasureText(s, f, new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
-            Store(key, r);
-            return r;
+            return GdiSize(s, f);
         }
 
         /// <summary>文本实际占到的像素高（含 GDI 内边距），算最小行高时用。</summary>
