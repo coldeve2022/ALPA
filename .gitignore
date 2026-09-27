@@ -2,6 +2,8 @@
 ui-v2/obj/
 ui-v2/build/
 ui-v2/build_cs5/
+tools/*/obj/
+tools/*/build/
 bin/
 obj/
 
