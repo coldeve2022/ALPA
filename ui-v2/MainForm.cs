@@ -655,10 +655,34 @@ namespace ALP2
                     string csv = eng.ExportSpikesCsv(dir);
                     string rep = eng.ExportReport(dir);
                     PeriodResult pr = Engine.AnalyzePeriods(eng.Spikes);
+
+                    // 回归测试：用户滚到中间后，下一次采样刷新不应把位置拽回顶部
+                    SpikeFeed feed = new SpikeFeed();
+                    feed.Set(eng.Spikes, null);
+                    feed.ScrollTo(40);
+                    // 注意：Set 会把传入列表反转成「新的在上」，所以这里每次都从
+                    // eng.Spikes 重新取原始顺序，不能复用已被反转过的列表
+                    List<SpikeRec> next = new List<SpikeRec>(eng.Spikes);
+                    string beforeKey = feed.TopItem == null ? "?" : feed.TopItem.AtSec.ToString("0.####");
+                    for (int i = 0; i < 3; i++)
+                    {
+                        // 模拟来了 3 条更新的尖峰（时间更晚，刷新后排在最前面）
+                        SpikeRec n = new SpikeRec();
+                        n.T = DateTime.Now.AddSeconds(i); n.Driver = "test.sys"; n.Where = "test.sys+0x1";
+                        n.Type = "DPC"; n.Us = 600; n.AtSec = 99999 + i; n.SincePrevMs = 1000;
+                        next.Add(n);
+                    }
+                    feed.Set(next, null);
+                    string afterKey = feed.TopItem == null ? "?" : feed.TopItem.AtSec.ToString("0.####");
+                    string scrollOk = (beforeKey == afterKey && beforeKey != "?") ? "通过" : "失败";
+                    string scrollReport = "滚动前视口顶部 AtSec=" + beforeKey + " → 刷新后视口顶部 AtSec="
+                        + afterKey + " → " + scrollOk;
+
                     string report = "csv      = " + csv + Environment.NewLine
                         + "report   = " + rep + Environment.NewLine
                         + "spikes   = " + eng.Spikes.Count + Environment.NewLine
-                        + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine;
+                        + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine
+                        + "scroll   = " + scrollReport + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
                 }
                 catch (Exception ex)

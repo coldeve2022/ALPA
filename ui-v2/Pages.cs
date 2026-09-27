@@ -157,13 +157,51 @@ namespace ALP2
 
         public void Set(List<SpikeRec> items, string empty)
         {
+            // 锚定视口顶部那条尖峰：Set 每秒被采样调一次，如果在这里把 _scroll 清零，
+            // 用户手动滚下去的位置 1 秒后就被拽回最上面（实测就是这样）。
+            // 规则：停在顶部 = 跟随最新；滚到别处 = 锚住那一条，新数据来了也原地不动。
+            int oldScroll = _scroll;
+            string anchor = (oldScroll > 0 && oldScroll < _items.Count) ? KeyOf(_items[oldScroll]) : null;
+
             _items = items != null ? items : new List<SpikeRec>();
             _items.Reverse();          // 新的在上
-            _scroll = 0;
-            if (_sb.Visible) _sb.Value = 0;
+
+            if (oldScroll <= 0 || anchor == null)
+            {
+                _scroll = 0;           // 本来就在顶部 → 继续跟随最新
+            }
+            else
+            {
+                int idx = -1;
+                for (int i = 0; i < _items.Count; i++)
+                {
+                    if (KeyOf(_items[i]) == anchor) { idx = i; break; }
+                }
+                // 锚点还在就回到它（新尖峰只会在顶部插入，老条目顺延）；
+                // 锚点被 600 条上限挤掉了就保持原行号，交给 LayoutScroll 收敛
+                _scroll = idx >= 0 ? idx : oldScroll;
+            }
+
             if (empty != null) _empty = empty;
             LayoutScroll();
             if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        private static string KeyOf(SpikeRec r)
+        {
+            return r.AtSec.ToString("0.####") + "|" + r.Driver + "|" + r.Type + "|" + r.Us.ToString("0.#");
+        }
+
+        /// <summary>自检/测试用：模拟用户滚动到某一行。</summary>
+        public void ScrollTo(int row) { _scroll = Math.Max(0, row); LayoutScroll(); }
+
+        /// <summary>自检/测试用：当前视口顶部对应的条目序号（0 = 最新）。</summary>
+        public int TopIndex { get { return _scroll; } }
+
+        /// <summary>自检/测试用：当前视口顶部那条尖峰（判定"位置是否保持"用它，别用序号）。</summary>
+        public SpikeRec TopItem
+        {
+            get { return (_scroll >= 0 && _scroll < _items.Count) ? _items[_scroll] : null; }
         }
 
         /// <summary>给宿主页面的滚轮转发入口（无焦点时滚轮消息到不了这里）。</summary>
@@ -187,7 +225,9 @@ namespace ALP2
                 _sb.Minimum = 0;
                 _sb.Maximum = Math.Max(0, _items.Count - view);
                 _sb.LargeChange = Math.Max(1, view);
-                if (_scroll > _sb.Maximum) { _scroll = _sb.Maximum; _sb.Value = _scroll; }
+                if (_scroll > _sb.Maximum) _scroll = _sb.Maximum;
+                if (_scroll < 0) _scroll = 0;
+                _sb.Value = _scroll;   // 每次都同步，别让滚动条和内部状态各走各的
             }
         }
 

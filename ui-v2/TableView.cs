@@ -142,6 +142,13 @@ namespace ALP2
         public void SetRows(List<TableRow> rows)
         {
             string keep = (_selRow >= 0 && _selRow < _rows.Count) ? _rows[_selRow].RowKey : null;
+
+            // 滚动锚定：数据每秒重建、还会重新排序，只保住 _scroll 这个行号的话，
+            // 用户看到的行会整体漂移（尤其排序键在变的时候）。用 RowKey 锚定视口顶部那行。
+            string scrollKey = (_scroll > 0 && _scroll < _rows.Count && !string.IsNullOrEmpty(_rows[_scroll].RowKey))
+                ? _rows[_scroll].RowKey : null;
+            int oldScroll = _scroll;
+
             _rows = rows != null ? rows : new List<TableRow>();
             FitColumns();
             ApplySort();
@@ -159,6 +166,29 @@ namespace ALP2
                 _selRow = -1;
             }
             ClampSelection();
+
+            // 锚点回定位（放在排序之后，因为 RowKey 的新位置要等排序才确定）
+            if (_scroll > 0 && oldScroll > 0)
+            {
+                if (!string.IsNullOrEmpty(scrollKey))
+                {
+                    int found = -1;
+                    for (int i = 0; i < _rows.Count; i++)
+                    {
+                        if (_rows[i].RowKey == scrollKey) { found = i; break; }
+                    }
+                    _scroll = found >= 0 ? found : Math.Min(oldScroll, Math.Max(0, _rows.Count - 1));
+                }
+                else
+                {
+                    _scroll = Math.Min(oldScroll, Math.Max(0, _rows.Count - 1));
+                }
+            }
+            else if (oldScroll <= 0)
+            {
+                _scroll = 0;
+            }
+
             AutoWidth();
             UpdateScrollBar();
             if (!IsDisposed && IsHandleCreated) Invalidate();
