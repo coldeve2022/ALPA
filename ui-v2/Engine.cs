@@ -36,6 +36,12 @@ namespace ALP2
         public string Driver = "";
         public string Type = "";
         public double Us;
+        /// <summary>模块 + 模块内偏移，例如 ntoskrnl.exe+0x1a2b40。</summary>
+        public string Where = "";
+        /// <summary>距上一个尖峰的毫秒数（第一个为 0）。判断"固定间隔"靠它。</summary>
+        public double SincePrevMs;
+        /// <summary>自本次统计清零以来的秒数，导出时不受 Excel 改格式影响。</summary>
+        public double AtSec;
     }
 
     /// <summary>
@@ -260,7 +266,6 @@ namespace ALP2
         private readonly Dictionary<string, DriverStat> _dpc = new Dictionary<string, DriverStat>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DriverStat> _isr = new Dictionary<string, DriverStat>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<ulong, string> _modMap = new Dictionary<ulong, string>();
-        private readonly Dictionary<ulong, string> _resolveCache = new Dictionary<ulong, string>();
         private readonly List<SpikeRec> _spikes = new List<SpikeRec>();
         private const int MaxSpikes = 600;
 
@@ -273,6 +278,7 @@ namespace ALP2
         private readonly long[] _dpcCountAtLast = new long[2];
         private readonly long[] _isrCountAtLast = new long[2];
         private long _spikeCount;
+        private long _lastSpikeTs;   // Stopwatch.GetTimestamp()，用于算尖峰间隔
 
         // 性能计数器
         private PerformanceCounter _pcProcQueue, _pcCtxSw, _pcIntTotal, _pcParked;
@@ -619,7 +625,6 @@ namespace ALP2
                             lock (_modMap)
                             {
                                 _modMap[b] = n;
-                                _resolveCache.Clear();   // 模块表变了，解析缓存失效
                             }
                         }
                         catch { }
@@ -745,18 +750,30 @@ namespace ALP2
 
         private string ResolveName(ulong addr)
         {
+            long off;
+            return ResolveWhere(addr, out off);
+        }
+
+        /// <summary>
+        /// 把内核地址解析成「模块 + 模块内偏移」。
+        ///
+        /// 为什么要偏移：DPC 经常落在 ntoskrnl.exe 里，但"ntoskrnl.exe"等于没说 ——
+        /// 内核里有几万个例程。加上偏移（ntoskrnl.exe+0x1a2b40）才是可复现的指纹：
+        /// 同一 Windows 版本上偏移是稳定的，能拿去对符号表定位到具体例程，
+        /// 也能立刻看出是不是同一个源头在反复触发。
+        /// </summary>
+        private string ResolveWhere(ulong addr, out long offset)
+        {
+            offset = 0;
             if (addr == 0) return "unknown";
-            string cached;
             lock (_modMap)
             {
-                if (_resolveCache.TryGetValue(addr, out cached)) return cached;
                 if (_sortedBases.Length != _modMap.Count)
                 {
                     _sortedBases = new ulong[_modMap.Count];
                     _modMap.Keys.CopyTo(_sortedBases, 0);
                     Array.Sort(_sortedBases);
                 }
-                string result = "addr_" + addr.ToString("X");
                 int lo = 0, hi = _sortedBases.Length - 1, best = -1;
                 while (lo <= hi)
                 {
@@ -767,12 +784,14 @@ namespace ALP2
                 if (best >= 0)
                 {
                     string nm;
-                    if (_modMap.TryGetValue(_sortedBases[best], out nm)) result = nm;
+                    if (_modMap.TryGetValue(_sortedBases[best], out nm))
+                    {
+                        offset = (long)(addr - _sortedBases[best]);
+                        return nm;
+                    }
                 }
-                if (_resolveCache.Count > 20000) _resolveCache.Clear();
-                _resolveCache[addr] = result;
-                return result;
             }
+            return "addr_" + addr.ToString("X");
         }
 
         private void OnDpcOrIsr(object data, Dictionary<string, DriverStat> target, string type)
@@ -800,7 +819,9 @@ namespace ALP2
             }
             if (!have) return;
 
-            string driver = ResolveName(routine);
+            long off;
+            string driver = ResolveWhere(routine, out off);
+            string where = off > 0 ? driver + "+0x" + off.ToString("x") : driver;
 
             lock (_statLock)
             {
@@ -824,8 +845,14 @@ namespace ALP2
                 SpikeRec r = new SpikeRec();
                 r.T = DateTime.Now;
                 r.Driver = driver;
+                r.Where = where;
                 r.Type = type;
                 r.Us = us;
+                // 间隔用 Stopwatch 时间戳算，比 DateTime 的 15ms 粒度准得多
+                long nowTs = Stopwatch.GetTimestamp();
+                long prevTs = Interlocked.Exchange(ref _lastSpikeTs, nowTs);
+                r.SincePrevMs = prevTs == 0 ? 0 : (nowTs - prevTs) * 1000.0 / Stopwatch.Frequency;
+                r.AtSec = _uptime.Elapsed.TotalSeconds;
                 lock (_statLock)
                 {
                     _spikes.Add(r);
@@ -1444,18 +1471,123 @@ namespace ALP2
             }
         }
 
+        /// <summary>
+        /// 导出尖峰明细。列设计刻意做了两件防呆：
+        ///  · 除了可读时间，再给 T+(秒) 与 间隔(ms) 两个**纯数字**列 ——
+        ///    用 Excel / WPS 直接打开时，时间列会被按本地日期格式重排（秒会丢掉），
+        ///    数字列则不受影响，所以做间隔分析要看这两列；
+        ///  · 文件头直接写入周期性分析的结论，拿到这个 CSV 就能看到"是不是固定间隔"。
+        /// </summary>
         public string ExportSpikesCsv(string dir)
         {
+            List<SpikeRec> snap;
+            lock (_statLock) snap = new List<SpikeRec>(_spikes);
+
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine("Time;Driver;Type;Duration(us)");
-            lock (_statLock)
+            sb.AppendLine("# ALPA v2 kernel spike detail");
+            sb.AppendLine("# exported; " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("# threshold; DPC >= " + DpcThreshold.ToString("0") + " us; ISR >= " + IsrThreshold.ToString("0") + " us");
+            sb.AppendLine("# hint; Excel/WPS 直接打开会把时间列改成本地格式(秒会丢失)，分析间隔请用 T+(s) 与 SincePrev(ms) 两列");
+
+            PeriodResult pr = AnalyzePeriods(snap);
+            sb.AppendLine("# periodicity; " + (pr == null
+                ? "样本不足或未发现固定间隔（相位集中度低于阈值）"
+                : pr.Describe().Replace(';', ',')));
+
+            double med, mn, mx;
+            IntervalStatsOf(snap, out med, out mn, out mx);
+            if (med > 0)
+                sb.AppendLine("# interval; median " + med.ToString("0.#") + " ms; min " + mn.ToString("0.#")
+                    + " ms; max " + mx.ToString("0.#") + " ms");
+
+            sb.AppendLine("Seq;Time;T+(s);SincePrev(ms);Driver;Location;Type;Duration(us)");
+
+            int i = 0;
+            foreach (SpikeRec r in snap)
             {
-                foreach (SpikeRec r in _spikes)
-                    sb.AppendLine(string.Format("{0:yyyy-MM-dd HH:mm:ss};{1};{2};{3:F2}", r.T, r.Driver, r.Type, r.Us));
+                i++;
+                double prev = r.SincePrevMs;
+                if (prev <= 0 && i > 1) prev = (r.AtSec - snap[i - 2].AtSec) * 1000.0;
+                sb.AppendLine(string.Format("{0};{1:yyyy-MM-dd HH:mm:ss.fff};{2};{3};{4};{5};{6};{7:F2}",
+                    i, r.T, r.AtSec.ToString("0.###"), prev.ToString("0.##"),
+                    r.Driver, r.Where, r.Type, r.Us));
             }
+
             string f = Path.Combine(dir, "ALPA_v2_Spikes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv");
             File.WriteAllText(f, sb.ToString(), new UTF8Encoding(true));
             return f;
+        }
+
+        /// <summary>对给定尖峰序列做周期性分析（UI 与导出共用）。</summary>
+        public static PeriodResult AnalyzePeriods(List<SpikeRec> list)
+        {
+            if (list == null || list.Count < 6) return null;
+            List<double> t = new List<double>(list.Count);
+            for (int i = 0; i < list.Count; i++) t.Add(list[i].AtSec);
+            return Periodicity.Analyze(t, 0.02, 3600.0);
+        }
+
+        /// <summary>对当前缓冲里的尖峰做一次分析（UI 用）。</summary>
+        public PeriodResult AnalyzePeriodsNow()
+        {
+            List<SpikeRec> snap;
+            lock (_statLock) snap = new List<SpikeRec>(_spikes);
+            return AnalyzePeriods(snap);
+        }
+
+        /// <summary>当前尖峰的相邻间隔统计（UI 用，省得 UI 再取一次快照）。</summary>
+        public void IntervalStats(out double med, out double mn, out double mx)
+        {
+            List<SpikeRec> snap;
+            lock (_statLock) snap = new List<SpikeRec>(_spikes);
+            IntervalStatsOf(snap, out med, out mn, out mx);
+        }
+
+        private static void IntervalStatsOf(List<SpikeRec> list, out double med, out double mn, out double mx)
+        {
+            med = mn = mx = 0;
+            if (list == null || list.Count < 2) return;
+            List<double> d = new List<double>(list.Count - 1);
+            for (int i = 1; i < list.Count; i++)
+            {
+                double ms = list[i].SincePrevMs > 0 ? list[i].SincePrevMs : (list[i].AtSec - list[i - 1].AtSec) * 1000.0;
+                if (ms >= 0) d.Add(ms);
+            }
+            if (d.Count == 0) return;
+            d.Sort();
+            mn = d[0]; mx = d[d.Count - 1]; med = d[d.Count / 2];
+        }
+
+        /// <summary>
+        /// 自检入口：造一批合成尖峰，用来验证「导出格式 + 周期分析」这两段逻辑。
+        /// 内核追踪需要管理员权限，有了这个入口，无权限时也能把这两段跑通验证。
+        /// 仅由 --selftest 调用，不影响正常运行。
+        /// </summary>
+        public void InjectSyntheticSpikes(int bursts, double periodSec, int perBurst)
+        {
+            Random rnd = new Random(20260927);
+            lock (_statLock)
+            {
+                _spikes.Clear();
+                for (int b = 0; b < bursts; b++)
+                {
+                    double start = b * periodSec;
+                    for (int k = 0; k < perBurst; k++)
+                    {
+                        SpikeRec r = new SpikeRec();
+                        r.Driver = "ntoskrnl.exe";
+                        r.Where = "ntoskrnl.exe+0x" + rnd.Next(0x100000, 0x900000).ToString("x");
+                        r.Type = "DPC";
+                        r.Us = 500 + rnd.NextDouble() * 160;
+                        r.AtSec = start + k * 1.1 + rnd.NextDouble() * 0.15;   // 阵内约 1.1 秒一个
+                        r.T = DateTime.Now.AddSeconds(r.AtSec - bursts * periodSec);
+                        _spikes.Add(r);
+                    }
+                }
+                for (int i = 1; i < _spikes.Count; i++)
+                    _spikes[i].SincePrevMs = (_spikes[i].AtSec - _spikes[i - 1].AtSec) * 1000.0;
+                _spikeCount = _spikes.Count;
+            }
         }
 
         public List<SpikeRec> Spikes

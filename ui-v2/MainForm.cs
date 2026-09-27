@@ -618,11 +618,13 @@ namespace ALP2
             Theme.S = Math.Max(0.6f, dpiScale * fit);
 
             bool noElevate = false;
+            bool selfTest = false;
             int startPage = -1;
             float forcedScale = 0f;
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--no-elevate") noElevate = true;
+                else if (args[i] == "--selftest") selfTest = true;
                 else if (args[i].StartsWith("--page=", StringComparison.OrdinalIgnoreCase))
                 {
                     int.TryParse(args[i].Substring(7), out startPage);
@@ -638,6 +640,31 @@ namespace ALP2
             {
                 Theme.S = Math.Max(0.5f, Math.Min(2.5f, forcedScale));
                 FitScale = Theme.S;
+            }
+
+            if (selfTest)
+            {
+                // 造 5 阵 × 32 个尖峰、阵间距 900 秒，验证导出格式与周期判定。
+                // 走这一步不需要管理员权限，所以内核追踪那条链路不可用时也能验证这两段逻辑。
+                try
+                {
+                    string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "alpa_selftest");
+                    System.IO.Directory.CreateDirectory(dir);
+                    Engine eng = new Engine();
+                    eng.InjectSyntheticSpikes(5, 900.0, 32);
+                    string csv = eng.ExportSpikesCsv(dir);
+                    PeriodResult pr = Engine.AnalyzePeriods(eng.Spikes);
+                    string report = "csv      = " + csv + Environment.NewLine
+                        + "spikes   = " + eng.Spikes.Count + Environment.NewLine
+                        + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine;
+                    System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
+                }
+                catch (Exception ex)
+                {
+                    System.IO.File.WriteAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "alpa_selftest_error.txt"),
+                        ex.ToString(), System.Text.Encoding.UTF8);
+                }
+                return;
             }
 
             if (!Engine.IsElevated() && !noElevate)

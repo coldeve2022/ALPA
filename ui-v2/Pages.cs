@@ -735,7 +735,49 @@ namespace ALP2
             _feed.Set(tail, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
 
             HeadRight = "累计尖峰 " + s.SpikeCount.ToString("#,0") + " 次";
+            UpdatePeriodicity(s);
             Invalidate();
+        }
+
+        private int _periodTick;
+
+        /// <summary>
+        /// 把「尖峰是不是固定间隔、间隔多少」直接算出来写在卡片上。
+        /// 每 5 秒算一次即可 —— 分析是 O(候选周期 × 尖峰数)，没必要每秒做。
+        /// </summary>
+        private void UpdatePeriodicity(Snapshot s)
+        {
+            _periodTick++;
+            if (_periodTick % 5 != 1 && _periodTick != 1) return;
+
+            string sub;
+            if (s.SpikeCount == 0)
+            {
+                sub = "超过阈值的内核回调，按时间倒序";
+            }
+            else
+            {
+                PeriodResult pr = Eng.AnalyzePeriodsNow();
+                double med, mn, mx;
+                Eng.IntervalStats(out med, out mn, out mx);
+                string head = "共 " + s.SpikeCount.ToString("#,0") + " 次";
+                if (med > 0) head += " · 相邻间隔中位 " + (med >= 1000 ? (med / 1000.0).ToString("0.##") + " s" : med.ToString("0") + " ms");
+                sub = pr == null
+                    ? head + " · 未发现固定间隔"
+                    : head + " · 疑似周期 " + PeriodShort(pr.PeriodSec) + "（集中度 " + (pr.Score * 100).ToString("0") + "%）";
+            }
+            if (_cardSpikes.Subtitle != sub)
+            {
+                _cardSpikes.Subtitle = sub;
+                _cardSpikes.Invalidate();
+            }
+        }
+
+        private static string PeriodShort(double sec)
+        {
+            if (sec >= 120) return (sec / 60.0).ToString("0.#") + " 分钟";
+            if (sec >= 1) return sec.ToString("0.##") + " 秒";
+            return (sec * 1000).ToString("0") + " 毫秒";
         }
 
         private static void AddRows(List<TableRow> rows, List<DriverStat> src)
