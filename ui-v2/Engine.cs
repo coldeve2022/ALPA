@@ -283,7 +283,16 @@ namespace ALP2
         private readonly List<SpikeRec> _spikes = new List<SpikeRec>();
         // 600 条会被一阵密集尖峰冲满（实测：中位间隔 1.4ms 时，600 条只覆盖一两秒），
         // 那样长周期分析就没数据可用了。放宽到 4000，并在报告里写上实际覆盖的时间跨度。
-        private const int MaxSpikes = 4000;
+        // 尖峰明细是"全会话归档"：导出必须忠实反映启动以来的全部尖峰，
+        // 只有 UI 显示才需要截断（见 RecentSpikes）。200000 条约 20~30MB，
+        // 够任何真实会话用；万一真的超了，也不静默丢弃 —— 见 _spikesDropped。
+        private const int MaxSpikes = 200000;
+
+        /// <summary>UI 尖峰日志只看最近这么多条（归档仍是完整的）。</summary>
+        public const int UiSpikeWindow = 4000;
+
+        private long _spikesDropped;                 // 因超出上限未保留的条数（正常为 0）
+        private readonly Dictionary<ulong, string> _whereCache = new Dictionary<ulong, string>();
 
         private TraceEventSession _session;
         private Thread _traceThread;
@@ -844,6 +853,27 @@ namespace ALP2
         }
 
         /// <summary>
+        /// 把「模块+偏移」文本按地址缓存起来。
+        /// 好处有两个：热路径不再每个事件都拼字符串；所有尖峰共享同一批字符串实例，
+        /// 归档到几十万条时内存能省下一大截。
+        /// </summary>
+        private string WhereText(ulong addr, string driver, long off)
+        {
+            string w;
+            lock (_whereCache)
+            {
+                if (addr != 0 && _whereCache.TryGetValue(addr, out w)) return w;
+                w = off > 0 ? driver + "+0x" + off.ToString("x") : driver;
+                if (addr != 0)
+                {
+                    if (_whereCache.Count > 20000) _whereCache.Clear();
+                    _whereCache[addr] = w;
+                }
+            }
+            return w;
+        }
+
+        /// <summary>
         /// 把一次 DPC/ISR 样本并入统计。真实事件与 --selftest 的合成数据共用这一条路径，
         /// 保证「报告里的每个口径」都能在无管理员权限时被验证。
         /// </summary>
@@ -900,7 +930,12 @@ namespace ALP2
                     // atSec >= 0 表示调用方自带时间轴（自检注入用），否则取真实时钟
                     r.AtSec = atSec >= 0 ? atSec : _uptime.Elapsed.TotalSeconds;
                     _spikes.Add(r);
-                    if (_spikes.Count > MaxSpikes) _spikes.RemoveRange(0, _spikes.Count - MaxSpikes);
+                    if (_spikes.Count > MaxSpikes)
+                    {
+                        int over = _spikes.Count - MaxSpikes;
+                        _spikes.RemoveRange(0, over);
+                        _spikesDropped += over;   // 记下来，导出时如实写明，不假装没丢
+                    }
 
                     // 同时维护"最长榜"：按执行时间降序插入，超量截断
                     int ins = _topSpikes.Count;
@@ -947,7 +982,7 @@ namespace ALP2
 
             long off;
             string driver = ResolveWhere(routine, out off);
-            string where = off > 0 ? driver + "+0x" + off.ToString("x") : driver;
+            string where = WhereText(routine, driver, off);
             RecordSample(target, driver, where, type, us, cpu, -1);
 
         }
@@ -1646,7 +1681,8 @@ namespace ALP2
             lock (_statLock) snap = new List<SpikeRec>(_spikes);
 
             StringBuilder sb = new StringBuilder();
-            sb.AppendLine(CsvLine("Seq", "Time", "T+(s)", "SincePrev(ms)", "Driver", "Location", "Type", "Duration(us)"));
+            sb.AppendLine(CsvLine("Seq", "Time", "Date", "TimeHMS",
+                "T+(s)", "SincePrev(ms)", "Driver", "Location", "Type", "Duration(us)"));
 
             int i = 0;
             foreach (SpikeRec r in snap)
@@ -1654,8 +1690,13 @@ namespace ALP2
                 i++;
                 double prev = r.SincePrevMs;
                 if (prev <= 0 && i > 1) prev = (r.AtSec - snap[i - 2].AtSec) * 1000.0;
+                // Time 用 ISO 8601 的 T 分隔形式：实测 Excel/WPS 不会把它当日期解析，
+                // 会原样显示（而 "2026-09-28 11:07:37.020" 会被当成时间值显示成 "07:37.0"）。
+                // 另外给 Date / TimeHMS / ms 三列，方便在 Excel 里做原生日期排序与图表。
                 sb.AppendLine(CsvLine(i.ToString(),
-                    r.T.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                    r.T.ToString("yyyy-MM-ddTHH:mm:ss.fff"),
+                    r.T.ToString("yyyy-MM-dd"),
+                    r.T.ToString("HH:mm:ss"),
                     r.AtSec.ToString("0.###"), prev.ToString("0.##"),
                     r.Driver, r.Where, r.Type, r.Us.ToString("F2")));
             }
@@ -1667,17 +1708,27 @@ namespace ALP2
             // 同时写一份列说明：用户看到一堆英文列名时最需要的就是这个
             try
             {
+                long spikeTotal = SpikeTotal;
+                long dropped = SpikesDropped;
+                string droppedText = dropped > 0 ? ("，其中 " + dropped + " 条超出归档上限未保留") : "，无遗漏";
+
                 StringBuilder d = new StringBuilder();
                 d.AppendLine("ALPA v2 尖峰明细 CSV - 列说明");
                 d.AppendLine("生成时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
                 d.AppendLine();
                 d.AppendLine("Seq            序号，本次导出内从 1 递增");
-                d.AppendLine("Time           事件发生时刻（本地时间，精确到毫秒）");
-                d.AppendLine("               [!] 用 Excel/WPS 打开并保存后，这一列会被改成本地日期/时间格式、");
-                d.AppendLine("                   秒会丢失。所以做时间分析请用下面两列纯数字。");
-                d.AppendLine("T+(s)          自本次程序启动以来的秒数（单调递增，不受 Excel 影响）");
-                d.AppendLine("SincePrev(ms)  本行与上一行尖峰之间的间隔（毫秒）—— 想看[是不是固定间隔]看这一列");
+                d.AppendLine();
+                d.AppendLine("--- 时间相关的四列，按需要选用 ---");
+                d.AppendLine("Time           事件发生时刻，ISO 8601 带 T 分隔，精确到毫秒：");
+                d.AppendLine("               2026-09-28T11:07:37.020");
+                d.AppendLine("               之所以用 T 而不是空格，是因为 Excel/WPS 会把[带毫秒的空格格式]");
+                d.AppendLine("               当成时间值，只显示成 07:37.0（日期与小时都丢）。用 T 就原样显示，零丢失。");
+                d.AppendLine("Date           日期（2026-09-28）。Excel 会识别成原生日期，方便排序/筛选/透视");
+                d.AppendLine("TimeHMS        时分秒（11:07:37）。Excel 原生时间，秒可见");
+                d.AppendLine("T+(s)          自本次程序启动（或上次清零）以来的秒数，纯数字，适合做间隔/分布分析");
+                d.AppendLine("SincePrev(ms)  与上一行尖峰的间隔（毫秒）—— 想看[是不是固定间隔]就看这一列");
                 d.AppendLine("               第一行为 0；若中位远小于最大值，说明尖峰成阵出现：阵内密、阵间疏");
+                d.AppendLine();
                 d.AppendLine("Driver         驱动模块名（程序里[驱动延迟表]按这一列分组）");
                 d.AppendLine("Location       驱动 + 模块内偏移，例如 ntoskrnl.exe+0x80a33a");
                 d.AppendLine("               同一 Windows 版本上偏移稳定，可用来定位具体内核例程、判断是否同一源头");
@@ -1687,9 +1738,14 @@ namespace ALP2
                 d.AppendLine("参考阈值（微软官方对驱动的要求）：DPC 不超过 100us、ISR 不超过 25us；");
                 d.AppendLine("1~3ms 视为警告，超过 3ms 视为错误。");
                 d.AppendLine();
-                d.AppendLine("[重要] 本文件只包含[最近 " + MaxSpikes + " 条]尖峰，更早的会被滚动丢弃。");
-                d.AppendLine("       所以要全会话的最大值/最坏事件，请看[导出报告]里的");
-                d.AppendLine("       [DPC/ISR 统计]与[全会话最长的尖峰]两节 —— 那两处不受滚动影响。");
+                d.AppendLine("[Excel 小提示] 若某列显示成 ####### 或文字被截断，说明列太窄：");
+                d.AppendLine("              Ctrl+A 全选后双击任意列边界，让 Excel 自动适应列宽即可。");
+                d.AppendLine();
+                d.AppendLine("[覆盖范围] 本文件是[本次统计周期]的完整尖峰明细（自程序启动或上次清零起），");
+                d.AppendLine("           共 " + spikeTotal + " 条" + droppedText + "。");
+                d.AppendLine("           UI 里的尖峰日志只显示最近 " + UiSpikeWindow + " 条，但导出是完整的。");
+                d.AppendLine("           要与会话最大值/最坏事件对照，请看[导出报告]里的");
+                d.AppendLine("           [DPC/ISR 统计]与[全会话最长的尖峰]两节。");
                 File.WriteAllText(Path.Combine(dir, "ALPA_v2_Spikes_" + stamp + "_列说明.txt"),
                     d.ToString(), new UTF8Encoding(true));
             }
@@ -1777,8 +1833,9 @@ namespace ALP2
             if (spikes.Count > 1)
             {
                 double span = spikes[spikes.Count - 1].AtSec - spikes[0].AtSec;
-                sb.AppendLine("缓冲覆盖: " + FmtMs(span * 1000)
-                    + (spikes.Count >= MaxSpikes ? "（已达 " + MaxSpikes + " 条上限，更早的尖峰已被丢弃）" : "（全部尖峰）"));
+                long dropped = SpikesDropped;
+                sb.AppendLine("明细覆盖: " + FmtMs(span * 1000) + "，共 " + spikes.Count.ToString("#,0") + " 条"
+                    + (dropped > 0 ? "（另有 " + dropped.ToString("#,0") + " 条超出归档上限未保留）" : "（完整，无遗漏）"));
             }
             sb.AppendLine("周期判定: " + (pr == null ? "样本不足或未发现固定间隔" : pr.Describe()));
             double med, mn, mx;
@@ -2169,6 +2226,7 @@ namespace ALP2
             lock (_statLock)
             {
                 _dpc.Clear(); _isr.Clear(); _spikes.Clear(); _topSpikes.Clear();
+                _spikesDropped = 0;
                 _dpcTotalUs = 0; _isrTotalUs = 0;
                 for (int i = 0; i < _dpcBuckets.Length; i++) { _dpcBuckets[i] = 0; _isrBuckets[i] = 0; }
                 for (int b = 0; b < bursts; b++)
@@ -2205,13 +2263,31 @@ namespace ALP2
             }
         }
 
+        /// <summary>完整归档（导出用）。UI 每秒刷新请改走 RecentSpikes，避免大列表反复拷贝。</summary>
         public List<SpikeRec> Spikes
         {
             get { lock (_statLock) return new List<SpikeRec>(_spikes); }
         }
 
+        /// <summary>最近 k 条（UI 显示用），只拷贝尾巴，开销与 k 相关而不是与总量相关。</summary>
+        public List<SpikeRec> RecentSpikes(int k)
+        {
+            lock (_statLock)
+            {
+                if (k >= _spikes.Count) return new List<SpikeRec>(_spikes);
+                if (k <= 0) return new List<SpikeRec>();
+                return _spikes.GetRange(_spikes.Count - k, k);
+            }
+        }
+
+        /// <summary>归档总数（导出时用来核对"是否完整"）。</summary>
+        public long SpikeTotal { get { lock (_statLock) return _spikes.Count + _spikesDropped; } }
+
+        /// <summary>因超出上限未保留的条数（正常为 0）。</summary>
+        public long SpikesDropped { get { lock (_statLock) return _spikesDropped; } }
+
         /// <summary>尖峰明细缓冲上限（UI 用来向用户说明"本列表只保留最近多少条"）。</summary>
-        public static int SpikeBufferSize { get { return MaxSpikes; } }
+        public static int SpikeBufferSize { get { return UiSpikeWindow; } }
 
         /// <summary>全会话最长的尖峰（降序），不受"最近 N 条"滚动影响。</summary>
         public List<SpikeRec> TopSpikes

@@ -678,11 +678,22 @@ namespace ALP2
                     string scrollReport = "滚动前视口顶部 AtSec=" + beforeKey + " → 刷新后视口顶部 AtSec="
                         + afterKey + " → " + scrollOk;
 
+                    // 回归：导出必须是完整归档，不能被 UI 的显示窗口截断
+                    int csvLines = 0;
+                    using (System.IO.StreamReader sr = new System.IO.StreamReader(csv))
+                    {
+                        while (sr.ReadLine() != null) csvLines++;
+                    }
+                    long archive = eng.SpikeTotal;
+                    string exportReport = "导出 " + (csvLines - 1) + " 条 / 归档 " + archive + " 条（UI 窗口 "
+                        + Engine.UiSpikeWindow + "）→ " + ((csvLines - 1 == archive) ? "通过" : "失败");
+
                     string report = "csv      = " + csv + Environment.NewLine
                         + "report   = " + rep + Environment.NewLine
                         + "spikes   = " + eng.Spikes.Count + Environment.NewLine
                         + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine
-                        + "scroll   = " + scrollReport + Environment.NewLine;
+                        + "scroll   = " + scrollReport + Environment.NewLine
+                        + "export   = " + exportReport + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
                 }
                 catch (Exception ex)

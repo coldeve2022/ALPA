@@ -556,9 +556,8 @@ namespace ALP2
             _chart.WarnUs = Eng.DpcThreshold;
             _chart.CritUs = Eng.DpcThreshold * 2;
 
-            List<SpikeRec> sp = Eng.Spikes;
-            // 传完整列表，让尖峰流自己滚动看历史（以前只给最后 40 条，更早的根本看不到）
-            _feed.Set(sp, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+            // UI 只取最近窗口（归档仍是完整的，导出不受影响）
+            _feed.Set(Eng.RecentSpikes(Engine.UiSpikeWindow), s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
 
             BuildTop(s);
             BuildMini(s);
@@ -868,8 +867,7 @@ namespace ALP2
             // 行对象每秒重建，但 SetRows 会按 RowKey 把选中项找回原位置
             SyncDetail();
 
-            List<SpikeRec> sp = Eng.Spikes;
-            _feed.Set(sp, s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
+            _feed.Set(Eng.RecentSpikes(Engine.UiSpikeWindow), s.Tracing ? null : "未启用内核追踪（需要管理员权限）");
 
             HeadRight = "累计尖峰 " + s.SpikeCount.ToString("#,0") + " 次";
             UpdatePeriodicity(s);
