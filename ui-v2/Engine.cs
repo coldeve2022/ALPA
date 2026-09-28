@@ -296,6 +296,18 @@ namespace ALP2
         private long _spikeCount;
         private long _lastSpikeTs;   // Stopwatch.GetTimestamp()，用于算尖峰间隔
 
+        /// <summary>
+        /// 全会话最长的 N 次尖峰，独立于"最近 N 条"的滚动缓冲。
+        ///
+        /// 为什么需要它：尖峰明细是按时间滚动的（只留最近若干条），
+        /// 于是出现过一个很自然但很误导的现象 —— 驱动表里某驱动的"最大"是 8761 µs，
+        /// 而尖峰日志里最大只有 1175 µs，用户以为工具在自相矛盾。
+        /// 其实只是那一次 8761 µs 早于窗口起点、已经被挤出去了。
+        /// 这份"最长榜"就是让最坏事件永远不会被忘掉。
+        /// </summary>
+        private readonly List<SpikeRec> _topSpikes = new List<SpikeRec>();
+        private const int MaxTopSpikes = 40;
+
         // ---- 报告用的聚合口径（每核心 / 分档 / 总量）----
         private CpuAgg[] _dpcCpu = new CpuAgg[Math.Max(1, Environment.ProcessorCount)];
         private CpuAgg[] _isrCpu = new CpuAgg[Math.Max(1, Environment.ProcessorCount)];
@@ -889,6 +901,16 @@ namespace ALP2
                     r.AtSec = atSec >= 0 ? atSec : _uptime.Elapsed.TotalSeconds;
                     _spikes.Add(r);
                     if (_spikes.Count > MaxSpikes) _spikes.RemoveRange(0, _spikes.Count - MaxSpikes);
+
+                    // 同时维护"最长榜"：按执行时间降序插入，超量截断
+                    int ins = _topSpikes.Count;
+                    for (int i = 0; i < _topSpikes.Count; i++)
+                    {
+                        if (us > _topSpikes[i].Us) { ins = i; break; }
+                    }
+                    _topSpikes.Insert(ins, r);
+                    if (_topSpikes.Count > MaxTopSpikes) _topSpikes.RemoveAt(_topSpikes.Count - 1);
+
                     Action<SpikeRec> h = Spike;
                     if (h != null) h(r);
                 }
@@ -1638,8 +1660,41 @@ namespace ALP2
                     r.Driver, r.Where, r.Type, r.Us.ToString("F2")));
             }
 
-            string f = Path.Combine(dir, "ALPA_v2_Spikes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv");
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string f = Path.Combine(dir, "ALPA_v2_Spikes_" + stamp + ".csv");
             File.WriteAllText(f, sb.ToString(), new UTF8Encoding(true));
+
+            // 同时写一份列说明：用户看到一堆英文列名时最需要的就是这个
+            try
+            {
+                StringBuilder d = new StringBuilder();
+                d.AppendLine("ALPA v2 尖峰明细 CSV - 列说明");
+                d.AppendLine("生成时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                d.AppendLine();
+                d.AppendLine("Seq            序号，本次导出内从 1 递增");
+                d.AppendLine("Time           事件发生时刻（本地时间，精确到毫秒）");
+                d.AppendLine("               [!] 用 Excel/WPS 打开并保存后，这一列会被改成本地日期/时间格式、");
+                d.AppendLine("                   秒会丢失。所以做时间分析请用下面两列纯数字。");
+                d.AppendLine("T+(s)          自本次程序启动以来的秒数（单调递增，不受 Excel 影响）");
+                d.AppendLine("SincePrev(ms)  本行与上一行尖峰之间的间隔（毫秒）—— 想看[是不是固定间隔]看这一列");
+                d.AppendLine("               第一行为 0；若中位远小于最大值，说明尖峰成阵出现：阵内密、阵间疏");
+                d.AppendLine("Driver         驱动模块名（程序里[驱动延迟表]按这一列分组）");
+                d.AppendLine("Location       驱动 + 模块内偏移，例如 ntoskrnl.exe+0x80a33a");
+                d.AppendLine("               同一 Windows 版本上偏移稳定，可用来定位具体内核例程、判断是否同一源头");
+                d.AppendLine("Type           事件类型：DPC 或 ISR");
+                d.AppendLine("Duration(us)   这一次事件本身的执行时间（微秒）");
+                d.AppendLine();
+                d.AppendLine("参考阈值（微软官方对驱动的要求）：DPC 不超过 100us、ISR 不超过 25us；");
+                d.AppendLine("1~3ms 视为警告，超过 3ms 视为错误。");
+                d.AppendLine();
+                d.AppendLine("[重要] 本文件只包含[最近 " + MaxSpikes + " 条]尖峰，更早的会被滚动丢弃。");
+                d.AppendLine("       所以要全会话的最大值/最坏事件，请看[导出报告]里的");
+                d.AppendLine("       [DPC/ISR 统计]与[全会话最长的尖峰]两节 —— 那两处不受滚动影响。");
+                File.WriteAllText(Path.Combine(dir, "ALPA_v2_Spikes_" + stamp + "_列说明.txt"),
+                    d.ToString(), new UTF8Encoding(true));
+            }
+            catch { }
+
             return f;
         }
 
@@ -1731,6 +1786,22 @@ namespace ALP2
             if (med > 0)
                 sb.AppendLine("相邻间隔: 中位 " + FmtMs(med) + " ; 最小 " + FmtMs(mn) + " ; 最大 " + FmtMs(mx)
                     + "（中位远小于最大值 = 成阵出现：阵内密、阵间疏）");
+
+            // 全会话最长榜：即使某次极端事件已被滚动缓冲挤掉，这里仍然留着
+            List<SpikeRec> top = TopSpikes;
+            if (top.Count > 0)
+            {
+                sb.AppendLine("全会话最长的尖峰（不受最近缓冲滚动影响，最多 15 条）:");
+                sb.AppendLine("    " + Pad("时刻", 22) + Pad("驱动", 20) + Pad("位置", 30) + Pad("类型", 6) + "时长(us)");
+                for (int i = 0; i < top.Count && i < 15; i++)
+                {
+                    SpikeRec r = top[i];
+                    sb.AppendLine("    " + Pad(r.T.ToString("MM-dd HH:mm:ss"), 22)
+                        + Pad(r.Driver, 20) + Pad(string.IsNullOrEmpty(r.Where) ? r.Driver : r.Where, 30)
+                        + Pad(r.Type, 6) + r.Us.ToString("0.#"));
+                }
+                sb.AppendLine();
+            }
 
             List<double> burstAt = BurstStarts(spikes, med);
             if (burstAt.Count > 0)
@@ -2097,7 +2168,7 @@ namespace ALP2
             Random rnd = new Random(20260927);
             lock (_statLock)
             {
-                _dpc.Clear(); _isr.Clear(); _spikes.Clear();
+                _dpc.Clear(); _isr.Clear(); _spikes.Clear(); _topSpikes.Clear();
                 _dpcTotalUs = 0; _isrTotalUs = 0;
                 for (int i = 0; i < _dpcBuckets.Length; i++) { _dpcBuckets[i] = 0; _isrBuckets[i] = 0; }
                 for (int b = 0; b < bursts; b++)
@@ -2137,6 +2208,15 @@ namespace ALP2
         public List<SpikeRec> Spikes
         {
             get { lock (_statLock) return new List<SpikeRec>(_spikes); }
+        }
+
+        /// <summary>尖峰明细缓冲上限（UI 用来向用户说明"本列表只保留最近多少条"）。</summary>
+        public static int SpikeBufferSize { get { return MaxSpikes; } }
+
+        /// <summary>全会话最长的尖峰（降序），不受"最近 N 条"滚动影响。</summary>
+        public List<SpikeRec> TopSpikes
+        {
+            get { lock (_statLock) return new List<SpikeRec>(_topSpikes); }
         }
 
         public void ResetStats()

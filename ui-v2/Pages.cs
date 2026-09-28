@@ -897,8 +897,14 @@ namespace ALP2
                 PeriodResult pr = Eng.AnalyzePeriodsNow();
                 double med, mn, mx;
                 Eng.IntervalStats(out med, out mn, out mx);
+                // 把「本列表只是最近一段」和「全会话最长是多少」都写在副标题上，
+                // 否则用户会拿列表里的最大值去对比驱动表的"最大"，看起来像自相矛盾
                 string head = "共 " + s.SpikeCount.ToString("#,0") + " 次";
-                if (med > 0) head += " · 相邻间隔中位 " + (med >= 1000 ? (med / 1000.0).ToString("0.##") + " s" : med.ToString("0") + " ms");
+                List<SpikeRec> top = Eng.TopSpikes;
+                if (top.Count > 0)
+                    head += " · 全会话最长 " + Fmt.Us(top[0].Us) + " µs（" + top[0].Driver + "）";
+                head += " · 本列表仅最近 " + Engine.SpikeBufferSize + " 条";
+                if (med > 0) head += " · 间隔中位 " + (med >= 1000 ? (med / 1000.0).ToString("0.##") + " s" : med.ToString("0") + " ms");
                 sub = pr == null
                     ? head + " · 未发现固定间隔"
                     : head + " · 疑似周期 " + PeriodShort(pr.PeriodSec) + "（集中度 " + (pr.Score * 100).ToString("0") + "%）";
