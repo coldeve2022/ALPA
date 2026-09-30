@@ -693,7 +693,8 @@ namespace ALP2
                         + "spikes   = " + eng.Spikes.Count + Environment.NewLine
                         + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine
                         + "scroll   = " + scrollReport + Environment.NewLine
-                        + "export   = " + exportReport + Environment.NewLine;
+                        + "export   = " + exportReport + Environment.NewLine
+                        + "chart    = " + eng.SelfTestPerSecond() + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
                 }
                 catch (Exception ex)

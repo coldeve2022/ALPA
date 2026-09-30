@@ -214,9 +214,9 @@ namespace ALP2
                     g.DrawLine(pen, x, plot.Y, x, plot.Bottom);
                 g.FillEllipse(new SolidBrush(p.Accent), x - Theme.Px(3), maxPts[_hoverIdx].Y - Theme.Px(3), Theme.Px(6), Theme.Px(6));
 
-                string l1 = "DPC 峰值 " + Fmt.Us(arr[_hoverIdx].MaxDpc) + " µs";
-                string l2 = "DPC 均值 " + Fmt.Us(arr[_hoverIdx].AvgDpc) + " µs";
-                string l3 = "ISR 峰值 " + Fmt.Us(arr[_hoverIdx].MaxIsr) + " µs";
+                string l1 = "DPC 该秒最大 " + Fmt.Us(arr[_hoverIdx].MaxDpc) + " µs";
+                string l2 = "DPC 该秒均值 " + Fmt.Us(arr[_hoverIdx].AvgDpc) + " µs";
+                string l3 = "ISR 该秒最大 " + Fmt.Us(arr[_hoverIdx].MaxIsr) + " µs";
                 string l4 = Fmt.Time(arr[_hoverIdx].T) + (arr[_hoverIdx].Spikes > 0 ? "  尖峰×" + arr[_hoverIdx].Spikes : "");
                 Font ft = Theme.F(8.2f, FontStyle.Regular);
                 int tw = Math.Max(Draw.Measure(l1, ft).Width, Math.Max(Draw.Measure(l2, ft).Width, Draw.Measure(l4, ft).Width)) + Theme.Px(20);

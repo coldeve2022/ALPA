@@ -212,10 +212,18 @@ namespace ALP2
 
         public double DpcPerSec;
         public double IsrPerSec;
+
+        // 以下三个是"本秒"的口径（曲线图用）：该秒内的最大与平均
         public double MaxDpc;
         public double MaxIsr;
         public double AvgDpc;
+        public int SpikesThisSec;
+
+        // 以下是"本会话"的口径（指标卡用）：累计最大值
+        public double SessionMaxDpc;
+        public double SessionMaxIsr;
         public string WorstDriver = "";
+        public string WorstIsrDriver = "";
         public int SpikeCount;
         public bool Tracing;
     }
@@ -299,6 +307,14 @@ namespace ALP2
         private Thread _sampleThread;
         private volatile bool _running;
         private volatile bool _stopping;
+
+        // 每秒聚合：曲线的"峰值/均值"必须是该秒内的，不能用历史最大值 ——
+        // 否则一抓到最大值就成一条平线，图表彻底失去意义（实测就是这个 bug）。
+        private double _secDpcMax, _secDpcSum;
+        private long _secDpcCnt;
+        private double _secIsrMax, _secIsrSum;
+        private long _secIsrCnt;
+        private long _spikeCountAtLast;
 
         private readonly long[] _dpcCountAtLast = new long[2];
         private readonly long[] _isrCountAtLast = new long[2];
@@ -915,6 +931,20 @@ namespace ALP2
                 (isDpc ? _dpcBuckets : _isrBuckets)[BucketIndex(us)]++;
                 if (isDpc) _dpcTotalUs += us; else _isrTotalUs += us;
 
+                // 本秒聚合（供曲线图）
+                if (isDpc)
+                {
+                    _secDpcCnt++;
+                    _secDpcSum += us;
+                    if (us > _secDpcMax) _secDpcMax = us;
+                }
+                else
+                {
+                    _secIsrCnt++;
+                    _secIsrSum += us;
+                    if (us > _secIsrMax) _secIsrMax = us;
+                }
+
                 if (us >= (isDpc ? DpcThreshold : IsrThreshold))
                 {
                     _spikeCount++;
@@ -1017,6 +1047,56 @@ namespace ALP2
             catch { return 0; }
         }
 
+        /// <summary>
+        /// 取走并清零「本秒」的聚合值。
+        ///
+        /// 曲线图要的是"该秒内的最大与平均"，绝不能拿历史最大值顶替 ——
+        /// 那样一抓到最大值曲线就变成一条平线（实测复现过这个 bug）。
+        /// 注意：取走后即清零，所以只能由每秒采样调用一次。
+        /// </summary>
+        private void TakePerSecond(out double dpcMax, out double dpcAvg, out double isrMax, out int spikes)
+        {
+            lock (_statLock)
+            {
+                dpcMax = _secDpcMax;
+                dpcAvg = _secDpcCnt > 0 ? (_secDpcSum / _secDpcCnt) : 0;
+                isrMax = _secIsrMax;
+                spikes = (int)Math.Max(0, _spikeCount - _spikeCountAtLast);
+                _spikeCountAtLast = _spikeCount;
+
+                _secDpcMax = 0; _secDpcSum = 0; _secDpcCnt = 0;
+                _secIsrMax = 0; _secIsrSum = 0; _secIsrCnt = 0;
+            }
+        }
+
+        /// <summary>
+        /// 自检：验证曲线取的是「本秒」而不是历史最大值。
+        /// 真实 DPC 事件需要管理员权限，所以这里直接喂合成样本走同一条聚合路径。
+        /// </summary>
+        public string SelfTestPerSecond()
+        {
+            ResetStats();
+            // 第 1 秒：DPC 100/5000/300，ISR 200/900
+            RecordSample(_dpc, "t.sys", "t.sys+0x1", "DPC", 100, 0, -1);
+            RecordSample(_dpc, "t.sys", "t.sys+0x1", "DPC", 5000, 0, -1);
+            RecordSample(_dpc, "t.sys", "t.sys+0x1", "DPC", 300, 0, -1);
+            RecordSample(_isr, "t.sys", "t.sys+0x1", "ISR", 200, 0, -1);
+            RecordSample(_isr, "t.sys", "t.sys+0x1", "ISR", 900, 0, -1);
+            double m1, a1, i1; int s1;
+            TakePerSecond(out m1, out a1, out i1, out s1);
+
+            // 第 2 秒：只有一条 50 µs 的 DPC（低于尖峰阈值）
+            RecordSample(_dpc, "t.sys", "t.sys+0x1", "DPC", 50, 0, -1);
+            double m2, a2, i2; int s2;
+            TakePerSecond(out m2, out a2, out i2, out s2);
+
+            // 第 1 秒应有 2 个尖峰：DPC 5000 ≥ 500µs 阈值 + ISR 900 ≥ 250µs 阈值
+            bool ok = Math.Abs(m1 - 5000) < 0.001 && Math.Abs(a1 - 1800) < 0.001 && Math.Abs(i1 - 900) < 0.001 && s1 == 2
+                && Math.Abs(m2 - 50) < 0.001 && Math.Abs(a2 - 50) < 0.001 && i2 == 0 && s2 == 0;
+            return string.Format("第1秒 最大={0}/均值={1}/ISR最大={2}/尖峰={3} ; 第2秒 最大={4}/均值={5}/ISR最大={6}/尖峰={7} -> {8}",
+                m1, a1, i1, s1, m2, a2, i2, s2, ok ? "通过（本秒口径，非历史最大值）" : "失败");
+        }
+
         private Snapshot BuildSnapshot()
         {
             Snapshot s = new Snapshot();
@@ -1029,27 +1109,30 @@ namespace ALP2
             lock (_statLock)
             {
                 s.SpikeCount = (int)Math.Min(int.MaxValue, _spikeCount);
+                // 会话累计最大值（指标卡用）
                 foreach (KeyValuePair<string, DriverStat> kv in _dpc)
                 {
                     s.Dpc.Add(kv.Value);
-                    if (kv.Value.Max > s.MaxDpc) { s.MaxDpc = kv.Value.Max; s.WorstDriver = kv.Value.Name; }
+                    if (kv.Value.Max > s.SessionMaxDpc) { s.SessionMaxDpc = kv.Value.Max; s.WorstDriver = kv.Value.Name; }
                 }
                 foreach (KeyValuePair<string, DriverStat> kv in _isr)
                 {
                     s.Isr.Add(kv.Value);
-                    if (kv.Value.Max > s.MaxIsr) s.MaxIsr = kv.Value.Max;
+                    if (kv.Value.Max > s.SessionMaxIsr) { s.SessionMaxIsr = kv.Value.Max; s.WorstIsrDriver = kv.Value.Name; }
                 }
+
                 long allCount = 0;
-                double allSum = 0;
-                foreach (KeyValuePair<string, DriverStat> kv in _dpc) { allCount += kv.Value.Count; allSum += kv.Value.Hist.Sum; }
+                foreach (KeyValuePair<string, DriverStat> kv in _dpc) allCount += kv.Value.Count;
                 s.DpcPerSec = allCount - _dpcCountAtLast[0];
                 _dpcCountAtLast[0] = allCount;
-                s.AvgDpc = s.DpcPerSec > 0 ? (allSum / Math.Max(1, allCount)) : 0;
 
                 long isrCount = 0;
                 foreach (KeyValuePair<string, DriverStat> kv in _isr) isrCount += kv.Value.Count;
                 s.IsrPerSec = isrCount - _isrCountAtLast[0];
                 _isrCountAtLast[0] = isrCount;
+
+                // 本秒口径（曲线图用）—— 取走后清零，因此 BuildSnapshot 只能由每秒采样调用
+                TakePerSecond(out s.MaxDpc, out s.AvgDpc, out s.MaxIsr, out s.SpikesThisSec);
             }
 
             s.MouseHz = _mouseHz;
@@ -2301,6 +2384,9 @@ namespace ALP2
             {
                 _dpc.Clear(); _isr.Clear(); _spikes.Clear();
                 _dpcCountAtLast[0] = 0; _dpcCountAtLast[1] = 0;
+                _secDpcMax = 0; _secDpcSum = 0; _secDpcCnt = 0;
+                _secIsrMax = 0; _secIsrSum = 0; _secIsrCnt = 0;
+                _spikeCountAtLast = 0;
                 for (int i = 0; i < _dpcCpu.Length; i++) _dpcCpu[i] = null;
                 for (int i = 0; i < _isrCpu.Length; i++) _isrCpu[i] = null;
                 for (int i = 0; i < _dpcBuckets.Length; i++) _dpcBuckets[i] = 0;

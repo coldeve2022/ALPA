@@ -531,15 +531,14 @@ namespace ALP2
 
         public override void OnSample(Snapshot s)
         {
-            Sev dsev = Engine.GradeDpc(s.MaxDpc);
-            _stat[0].Set("最高 DPC", Fmt.Us(s.MaxDpc), "µs",
-                string.IsNullOrEmpty(s.WorstDriver) ? "尚未捕获 DPC 事件" : "来自 " + s.WorstDriver, dsev);
+            // 指标卡展示「本会话」累计最大值；曲线图才用每秒口径（两者含义不同，别混用）
+            Sev dsev = Engine.GradeDpc(s.SessionMaxDpc);
+            _stat[0].Set("最高 DPC", Fmt.Us(s.SessionMaxDpc), "µs",
+                string.IsNullOrEmpty(s.WorstDriver) ? "尚未捕获 DPC 事件" : "本会话累计 · 来自 " + s.WorstDriver, dsev);
 
-            string worstIsr = "";
-            double maxIsr = 0;
-            foreach (DriverStat d in s.Isr) { if (d.Max > maxIsr) { maxIsr = d.Max; worstIsr = d.Name; } }
-            _stat[1].Set("最高 ISR", Fmt.Us(maxIsr), "µs",
-                string.IsNullOrEmpty(worstIsr) ? "尚未捕获 ISR 事件" : "来自 " + worstIsr, Engine.GradeIsr(maxIsr));
+            _stat[1].Set("最高 ISR", Fmt.Us(s.SessionMaxIsr), "µs",
+                string.IsNullOrEmpty(s.WorstIsrDriver) ? "尚未捕获 ISR 事件" : "本会话累计 · 来自 " + s.WorstIsrDriver,
+                Engine.GradeIsr(s.SessionMaxIsr));
 
             _stat[2].Set("DPC 速率", Fmt.Count((long)s.DpcPerSec), "/s",
                 "ISR " + Fmt.Count((long)s.IsrPerSec) + "/s", Sev.Info);
@@ -552,7 +551,7 @@ namespace ALP2
                 "阈值 DPC ≥ " + Eng.DpcThreshold.ToString("0") + "µs",
                 s.SpikeCount == 0 ? Sev.Ok : Sev.Warn);
 
-            _chart.Push(s.MaxDpc, s.AvgDpc, s.MaxIsr, s.SpikeCount > 0 ? 1 : 0);
+            _chart.Push(s.MaxDpc, s.AvgDpc, s.MaxIsr, s.SpikesThisSec);
             _chart.WarnUs = Eng.DpcThreshold;
             _chart.CritUs = Eng.DpcThreshold * 2;
 
