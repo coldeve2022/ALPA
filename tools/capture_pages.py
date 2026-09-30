@@ -20,6 +20,10 @@ EXE = sys.argv[1]
 OUTDIR = sys.argv[2]
 PAGES = [int(x) for x in (sys.argv[3].split(",") if len(sys.argv) > 3 else ["1", "2", "3", "4", "5", "6"])]
 EXTRA = sys.argv[4].split() if len(sys.argv) > 4 else []
+# 界面出现 ≠ 初始化完成：引擎要建计数器 + 扫体检项 + 扫启动项，慢时好几秒。
+# 抓早了会拍到"半初始化"的界面（卡片空白、提示条还没挂上），据此下结论会冤枉程序。
+import os as _os
+SETTLE = float(_os.environ.get('ALPA_SETTLE', '3'))
 TITLE_KEY = "ALPA v2"
 
 
@@ -87,7 +91,7 @@ for page in PAGES:
         user32.SetForegroundWindow(hwnd)
     except Exception:
         pass
-    time.sleep(3)   # 再给界面几秒把首个采样画上去
+    time.sleep(SETTLE)   # 再给界面几秒把首个采样画上去（可用 ALPA_SETTLE 调大）
 
     wins = [hwnd]
 

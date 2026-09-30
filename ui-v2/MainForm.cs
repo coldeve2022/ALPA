@@ -336,11 +336,28 @@ namespace ALP2
         /// 提示条有且只有三种状态：① 没提权；② 提权了但内核追踪没起来（把原因直接摆给用户看）；
         /// ③ 一切正常则不显示。用 key 去重，避免每秒重建按钮。
         /// </summary>
+        private bool _instWarnDismissed;
+        private EventHandler _bannerAct, _bannerAct2;
+
+        /// <summary>
+        /// 给提示条按钮装回调。必须先把上一个回调摘掉 —— 否则每切换一次提示条状态，
+        /// 旧回调都会累积在同一个按钮上（点一下会同时触发「以管理员重启」和「重试追踪」）。
+        /// </summary>
+        private void SetBannerActions(EventHandler a, EventHandler b)
+        {
+            if (_banner.Action != null && _bannerAct != null) _banner.Action.Click -= _bannerAct;
+            if (_banner.Action2 != null && _bannerAct2 != null) _banner.Action2.Click -= _bannerAct2;
+            _bannerAct = a; _bannerAct2 = b;
+            if (_banner.Action != null && a != null) _banner.Action.Click += a;
+            if (_banner.Action2 != null && b != null) _banner.Action2.Click += b;
+        }
+
         private void UpdateBanner(Snapshot s)
         {
             string key;
             if (!_eng.IsAdmin) key = "no-admin";
             else if (!string.IsNullOrEmpty(_eng.TraceError)) key = "trace:" + _eng.TraceError;
+            else if (_eng.OtherAlpa > 0 && !_instWarnDismissed) key = "multi:" + _eng.OtherAlpa;
             else key = "";
 
             if (key == _bannerKey) return;
@@ -359,16 +376,26 @@ namespace ALP2
                 _banner.Set("当前以普通权限运行，内核 DPC / ISR 追踪不可用",
                     "这一项是整个工具的核心能力，需要管理员权限才能挂载 ETW 内核会话。",
                     Sev.Warn, "以管理员身份重启", "查看日志");
-                if (_banner.Action != null) _banner.Action.Click += delegate { Elevate(); };
+                SetBannerActions(delegate { Elevate(); }, delegate { SetPage(5); });
+            }
+            else if (key.StartsWith("multi"))
+            {
+                _banner.Set("检测到还有 " + _eng.OtherAlpa + " 个 ALPA 实例在运行",
+                    "内核追踪会话（NT Kernel Logger）全机只能有一个，两个实例会互相抢占 —— "
+                    + "表现就是「跑十几分钟突然不再采集数据」。建议只保留一个实例，另一个直接关掉。",
+                    Sev.Warn, "不再提示", "查看日志");
+                SetBannerActions(
+                    delegate { _instWarnDismissed = true; _bannerKey = ""; UpdateBanner(null); },
+                    delegate { SetPage(5); });
             }
             else
             {
-                _banner.Set("内核 DPC / ISR 追踪没能启动 —— 这就是延迟数据空白的原因",
-                    "原因：" + _eng.TraceError + "。日志里有完整堆栈；若另一个延迟监控工具正占着内核会话，关掉它再点「重试追踪」。",
+                _banner.Set("内核 DPC / ISR 追踪已中断 —— 这就是延迟数据停止更新的原因",
+                    "原因：" + _eng.TraceError + "。日志里有完整记录；程序会先自动重建会话，"
+                    + "若多次不成功，通常是另一个 ALPA 实例或别的延迟监控工具占着内核会话，关掉它再点「重试追踪」。",
                     Sev.Crit, "重试追踪", "查看日志");
-                if (_banner.Action != null) _banner.Action.Click += delegate { RetryTracing(); };
+                SetBannerActions(delegate { RetryTracing(); }, delegate { SetPage(5); });
             }
-            if (_banner.Action2 != null) _banner.Action2.Click += delegate { SetPage(5); };
 
             _banner.Visible = true;
             LayoutHost();
@@ -492,7 +519,7 @@ namespace ALP2
             left = new string[]
             {
                 _eng.IsAdmin ? "管理员权限" : "普通权限",
-                _eng.IsTracing ? "内核追踪运行中" : "内核追踪未运行",
+                "内核追踪" + _eng.TracingHealth,
                 "DPC " + Fmt.Count((long)_lastDpcPerSec) + "/s",
                 "尖峰 " + _lastSpikes.ToString("#,0"),
                 "运行 " + Fmt.Span(_ui.Elapsed)
@@ -500,7 +527,7 @@ namespace ALP2
             sev = new Sev[]
             {
                 _eng.IsAdmin ? Sev.Ok : Sev.Warn,
-                _eng.IsTracing ? Sev.Ok : Sev.Warn,
+                (_eng.IsAdmin && _eng.TracingHealth == "运行中") ? Sev.Ok : Sev.Warn,
                 Sev.Info,
                 _lastSpikes > 0 ? Sev.Warn : Sev.Ok,
                 Sev.Neutral
@@ -688,6 +715,18 @@ namespace ALP2
                     string exportReport = "导出 " + (csvLines - 1) + " 条 / 归档 " + archive + " 条（UI 窗口 "
                         + Engine.UiSpikeWindow + "）→ " + ((csvLines - 1 == archive) ? "通过" : "失败");
 
+                    // ---- 看门狗判定（纯函数，无需真实内核会话）----
+                    bool w1 = Engine.TracingLossReason(false, true, true, true, 999) == null;    // 未提权：不报
+                    bool w2 = Engine.TracingLossReason(true, false, false, false, 999) == null;  // 已停止：不报
+                    bool w3 = Engine.TracingLossReason(true, true, false, true, 0) != null;      // 线程死了：报
+                    bool w4 = Engine.TracingLossReason(true, true, true, false, 0) != null;      // 会话没了：报
+                    bool w5 = Engine.TracingLossReason(true, true, true, true, 120) != null;     // 静默 120s：报
+                    bool w6 = Engine.TracingLossReason(true, true, true, true, 30) == null;      // 静默 30s：不报
+                    bool wdOk = w1 && w2 && w3 && w4 && w5 && w6;
+                    string wdReport = "未提权/已停止/线程死/会话没/静默120s/静默30s = "
+                        + (w1 ? "1" : "0") + (w2 ? "1" : "0") + (w3 ? "1" : "0") + (w4 ? "1" : "0")
+                        + (w5 ? "1" : "0") + (w6 ? "1" : "0") + " → " + (wdOk ? "通过" : "失败");
+
                     // ---- 时间线：长历史 + 拖动/缩放 + 两种导出 ----
                     TimelineChart tc = new TimelineChart();
                     Random rr = new Random(20260930);
@@ -734,7 +773,8 @@ namespace ALP2
                         + "scroll   = " + scrollReport + Environment.NewLine
                         + "export   = " + exportReport + Environment.NewLine
                         + "chart    = " + eng.SelfTestPerSecond() + Environment.NewLine
-                        + "timeline = " + timelineReport + Environment.NewLine;
+                        + "timeline = " + timelineReport + Environment.NewLine
+                        + "watchdog = " + wdReport + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
                 }
                 catch (Exception ex)

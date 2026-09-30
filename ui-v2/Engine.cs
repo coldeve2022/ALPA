@@ -310,6 +310,14 @@ namespace ALP2
 
         // 每秒聚合：曲线的"峰值/均值"必须是该秒内的，不能用历史最大值 ——
         // 否则一抓到最大值就成一条平线，图表彻底失去意义（实测就是这个 bug）。
+        // ---- 追踪健康度（看门狗用）----
+        private volatile bool _tracingWanted;      // 程序是否"期望"追踪在跑
+        private long _lastEventTicks;              // 最近一次收到 DPC/ISR 事件
+        private long _tracingStartedTicks;         // 本次会话创建时刻（静默判断的下限）
+        private long _lastRestartTicks;            // 上次自动重建时刻（防抖）
+        private int _traceRestarts;
+        private const int MaxAutoRestarts = 5;
+
         private double _secDpcMax, _secDpcSum;
         private long _secDpcCnt;
         private double _secIsrMax, _secIsrSum;
@@ -522,6 +530,8 @@ namespace ALP2
             }
             catch { }
             _traceError = null;
+            _traceRestarts = 0;
+            _lastRestartTicks = 0;
             if (IsAdmin) StartTracing();
             else Write("retry tracing skipped - not elevated", LogLevel.Warn);
         }
@@ -529,6 +539,7 @@ namespace ALP2
         /// <summary>手动停掉内核会话（不改动 _running，仅追踪层）。</summary>
         private void StopTracingSession()
         {
+            _tracingWanted = false;
             TraceEventSession s = _session;
             _session = null;
             if (s != null) { try { s.Dispose(); } catch { } }
@@ -550,6 +561,7 @@ namespace ALP2
             if (_stopping) return;
             _stopping = true;
             _running = false;
+            _tracingWanted = false;
             _uptime.Stop();
 
             TraceEventSession s = _session;
@@ -663,6 +675,9 @@ namespace ALP2
         // =====================================================================
         private void StartTracing()
         {
+            _tracingWanted = true;
+            _tracingStartedTicks = Stopwatch.GetTimestamp();
+            _lastEventTicks = 0;
             _traceThread = new Thread(delegate ()
             {
                 try
@@ -720,6 +735,12 @@ namespace ALP2
                     WriteNativeState();
                     _traceError = null;
                     session.Source.Process();
+
+                    // 关键：Process() 正常返回 = 会话被外部停掉/抢占（不是异常，所以 catch 抓不到）。
+                    // 以前这里直接让线程静默结束，界面却一直显示"追踪运行中" —— 程序在骗人。
+                    if (_tracingWanted)
+                        Write("kernel tracing session ended unexpectedly (consumer returned) - "
+                            + "另一个延迟监控工具或另一个 ALPA 实例可能抢占了 NT Kernel Logger", LogLevel.Crit);
                 }
                 catch (Exception ex)
                 {
@@ -1010,6 +1031,8 @@ namespace ALP2
             }
             if (!have) return;
 
+            _lastEventTicks = Stopwatch.GetTimestamp();   // 看门狗的心跳
+
             long off;
             string driver = ResolveWhere(routine, out off);
             string where = WhereText(routine, driver, off);
@@ -1034,6 +1057,9 @@ namespace ALP2
                     // 进程枚举很贵（每个进程都要开句柄 + 查 GPU 计数器），
                     // 每 2 秒做一次且在后台线程，UI 永远不会被它卡住。
                     if ((tick & 1) == 0) SampleProcesses();
+
+                    // 每 5 秒巡检一次内核会话：死了/静默了就自动重建，别让界面继续假装正常
+                    if (tick % 5 == 0) CheckTracingHealth();
                     tick++;
                 }
                 catch (Exception ex) { Write("sample error: " + ex.Message, LogLevel.Warn); }
@@ -1046,6 +1072,133 @@ namespace ALP2
             try { return c != null ? c.NextValue() : 0; }
             catch { return 0; }
         }
+
+        /// <summary>
+        /// 追踪是否已经"名存实亡"。纯函数（便于自检）：管理员 / 是否期望追踪 /
+        /// 线程是否活着 / 会话是否活着 / 静默秒数。返回 null 表示正常。
+        /// </summary>
+        internal static string TracingLossReason(bool admin, bool wanted, bool threadAlive, bool sessionAlive, double silentSec)
+        {
+            if (!admin || !wanted) return null;
+            if (!threadAlive) return "追踪线程已结束（内核会话被外部停止或被抢占）";
+            if (!sessionAlive) return "内核会话已不存在";
+            if (silentSec > 60) return "已 " + (int)silentSec + " 秒没有收到任何 DPC / ISR 事件";
+            return null;
+        }
+
+        private string LossReasonNow()
+        {
+            bool threadAlive = _traceThread != null && _traceThread.IsAlive;
+            bool sessionAlive = false;
+            try
+            {
+                TraceEventSession ses = _session;
+                sessionAlive = ses != null && ses.IsActive;
+            }
+            catch { sessionAlive = false; }
+            long now = Stopwatch.GetTimestamp();
+            long baseT = _lastEventTicks > _tracingStartedTicks ? _lastEventTicks : _tracingStartedTicks;
+            double silent = baseT == 0 ? 0 : (now - baseT) * 1000.0 / Stopwatch.Frequency / 1000.0;
+            if (baseT == 0) silent = 0;   // 刚启动，还没到静默判断的时候
+            return TracingLossReason(IsAdmin, _tracingWanted, threadAlive, sessionAlive, silent);
+        }
+
+        /// <summary>状态栏用的一句话：如实反映追踪到底有没有在干活。</summary>
+        public string TracingHealth
+        {
+            get
+            {
+                if (!IsAdmin) return "未运行（需管理员）";
+                if (!_tracingWanted) return "已停止";
+                if (_traceRestarts > 0) return "自动重建中（第 " + _traceRestarts + " 次）";
+                long baseT = _lastEventTicks > _tracingStartedTicks ? _lastEventTicks : _tracingStartedTicks;
+                if (baseT > 0)
+                {
+                    double silent = (Stopwatch.GetTimestamp() - baseT) * 1000.0 / Stopwatch.Frequency / 1000.0;
+                    if (silent > 10) return "运行中（" + (int)silent + " 秒无事件）";
+                }
+                return "运行中";
+            }
+        }
+
+        /// <summary>看门狗：会话死了就记录 + 自动重建；连续失败到上限就明确让用户处理。</summary>
+        private void CheckTracingHealth()
+        {
+            string why = LossReasonNow();
+            if (why == null)
+            {
+                // 恢复健康：把之前的失败记录清掉，界面横幅也会随之消失
+                if (_traceRestarts > 0)
+                {
+                    long baseT = _lastEventTicks;
+                    double okFor = baseT == 0 ? 0 : (Stopwatch.GetTimestamp() - baseT) * 1000.0 / Stopwatch.Frequency / 1000.0;
+                    if (baseT > 0 && okFor < 90) return;      // 事件刚回来，再观察一会儿
+                    Write("tracing watchdog: 追踪已恢复正常（此前自动重建 " + _traceRestarts + " 次）", LogLevel.Ok);
+                    _traceRestarts = 0;
+                    _traceError = null;
+                }
+                return;
+            }
+
+            long now = Stopwatch.GetTimestamp();
+            if (_lastRestartTicks != 0 && (now - _lastRestartTicks) * 1000.0 / Stopwatch.Frequency < 15000)
+                return;   // 防抖：重启后给它 15 秒
+
+            if (_traceRestarts >= MaxAutoRestarts)
+            {
+                _traceError = why + "。已自动重建 " + _traceRestarts + " 次仍未恢复 —— "
+                    + "多半是另一个 ALPA 实例或别的延迟监控工具占着 NT Kernel Logger"
+                    + "（这个内核会话全机只能有一个）。关掉其它实例后点「重试追踪」。";
+                return;
+            }
+
+            bool threadAlive = _traceThread != null && _traceThread.IsAlive;
+            _traceRestarts++;
+            _lastRestartTicks = now;
+            Write("tracing watchdog: " + why + " -> 第 " + _traceRestarts + " 次自动重建", LogLevel.Warn);
+
+            if (threadAlive)
+            {
+                // 线程还卡在 Process() 里：先拆掉旧会话（会让 Process 返回），下次心跳再重建
+                TraceEventSession s = _session;
+                _session = null;
+                if (s != null) { try { s.Dispose(); } catch { } }
+                _traceError = why + "；正在重建会话…（第 " + _traceRestarts + " 次）";
+            }
+            else
+            {
+                _traceError = why + "；已自动重建第 " + _traceRestarts + " 次…";
+                StartTracing();
+            }
+        }
+
+        /// <summary>
+        /// 数一下还有几个 ALPA 进程在跑（不含自己）。
+        /// 内核追踪会话是单例，两个实例会互相抢占 —— 这正是"跑十几分钟就断"的典型成因，
+        /// 所以启动时要主动提醒，而不是让用户对着一个不说实话的界面猜。
+        /// </summary>
+        public static int OtherAlpaInstances()
+        {
+            try
+            {
+                int cur = Process.GetCurrentProcess().Id;
+                int n = 0;
+                foreach (Process p in Process.GetProcesses())
+                {
+                    string nm = null;
+                    try { nm = p.ProcessName; } catch { }
+                    if (nm == null) continue;
+                    if (nm.StartsWith("ALPA", StringComparison.OrdinalIgnoreCase) && p.Id != cur) n++;
+                    p.Dispose();
+                }
+                return n;
+            }
+            catch { return 0; }
+        }
+
+        private int _otherAlpa = -1;
+        /// <summary>其它 ALPA 实例数（启动后查一次并缓存）。</summary>
+        public int OtherAlpa { get { if (_otherAlpa < 0) _otherAlpa = OtherAlpaInstances(); return _otherAlpa; } }
 
         /// <summary>
         /// 取走并清零「本秒」的聚合值。
