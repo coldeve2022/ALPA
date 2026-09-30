@@ -28,9 +28,9 @@
     <AssemblyTitle>ALPA v2 - Latency &amp; DPC Audit</AssemblyTitle>
     <Product>ALPA v2</Product>
     <Description>Readable light-theme UI rework of ALPA (Amazing Latency Performance Audit).</Description>
-    <Version>2.1.7</Version>
-    <FileVersion>2.1.7.0</FileVersion>
-    <AssemblyVersion>2.1.7.0</AssemblyVersion>
+    <Version>2.1.8</Version>
+    <FileVersion>2.1.8.0</FileVersion>
+    <AssemblyVersion>2.1.8.0</AssemblyVersion>
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <NoWarn>$(NoWarn);CS0649;CS0169;CS1591</NoWarn>

@@ -543,17 +543,11 @@ namespace ALP2
             TraceEventSession s = _session;
             _session = null;
             if (s != null) { try { s.Dispose(); } catch { } }
-            try
-            {
-                foreach (string name in TraceEventSession.GetActiveSessionNames())
-                {
-                    if (name == "NT Kernel Logger")
-                    {
-                        using (TraceEventSession k = new TraceEventSession(name)) k.Stop(true);
-                    }
-                }
-            }
-            catch { }
+            // 只关自己的会话就够了（Dispose 内部会 Stop）。
+            // 以前这里还会"按名字"再停一次 "NT Kernel Logger" —— 但那个会话是全机单例，
+            // 这么写会把**另一个 ALPA 实例**正在用的会话一起杀掉。
+            // 实测事故：实例 A 退出时杀掉了实例 B 的会话，B 从此停止采集却仍显示"运行中"。
+            // 残留会话由下次启动时的清理逻辑负责（见 StartTracing）。
         }
 
         public void Stop()
@@ -571,20 +565,10 @@ namespace ALP2
                 try { s.Dispose(); }
                 catch { }
             }
-            // 上游 v1 在退出时去找 "ALPKernelSession"，但真正开的会话叫 "NT Kernel Logger"，
-            // 结果内核会话根本没被关掉（下次运行 ETW 会报会话已存在）。
-            // 这里按真实名字兜底停一次。
-            try
-            {
-                foreach (string name in TraceEventSession.GetActiveSessionNames())
-                {
-                    if (name == "NT Kernel Logger")
-                    {
-                        using (TraceEventSession k = new TraceEventSession(name)) k.Stop(true);
-                    }
-                }
-            }
-            catch { }
+            // 这里以前有一段"按名字兜底停 NT Kernel Logger"的代码（为了清掉 v1 的残留会话）。
+            // 已删除：那个会话是全机单例，退出时盲杀会把另一个 ALPA 实例正在用的会话一起停掉 ——
+            // 实测事故就是这么发生的（A 退出 → B 停止采集却仍显示运行中）。
+            // 残留会话由下次启动的 StartTracing 清理，不该由"退出"来负责。
 
             DisposeCounters();
             Write("engine stopped", LogLevel.Info);
@@ -682,11 +666,24 @@ namespace ALP2
             {
                 try
                 {
-                    // 清掉可能残留的同名会话，否则 EnableKernelProvider 会失败
+                    // 清掉残留的同名会话，否则 EnableKernelProvider 会失败。
+                    // 但注意：这个内核会话全机单例，如果此刻有另一个 ALPA 实例（或别的延迟监控工具）
+                    // 正在用它，这一步会把对方一起停掉 —— 所以先确认它真的存在，并写进日志留痕。
                     try
                     {
-                        using (TraceEventSession killer = new TraceEventSession("NT Kernel Logger")) killer.Stop(true);
-                        Thread.Sleep(300);
+                        bool exists = false;
+                        foreach (string n in TraceEventSession.GetActiveSessionNames())
+                        {
+                            if (n == "NT Kernel Logger") { exists = true; break; }
+                        }
+                        if (exists)
+                        {
+                            Write("发现已存在的 NT Kernel Logger 会话，准备清理 —— 可能是上次异常退出的残留，"
+                                + "也可能有另一个 ALPA 实例/延迟工具正在用它（若是后者，对方的界面会停止更新）",
+                                LogLevel.Warn);
+                            using (TraceEventSession killer = new TraceEventSession("NT Kernel Logger")) killer.Stop(true);
+                            Thread.Sleep(300);
+                        }
                     }
                     catch { }
 
@@ -1143,6 +1140,22 @@ namespace ALP2
             long now = Stopwatch.GetTimestamp();
             if (_lastRestartTicks != 0 && (now - _lastRestartTicks) * 1000.0 / Stopwatch.Frequency < 15000)
                 return;   // 防抖：重启后给它 15 秒
+
+            // 有另一个 ALPA 实例在跑：会话被它占着是"正常现象"，不要跟它抢 ——
+            // 否则两个实例会互相重建、来回踢（对方也会把会话抢回去）。
+            // 只如实报告，等用户关掉那个实例后这里会自己恢复。
+            _otherAlpa = OtherAlpaInstances();
+            if (_otherAlpa > 0)
+            {
+                if (_traceError == null || _traceError.IndexOf("另一个 ALPA 实例") < 0)
+                {
+                    Write("tracing watchdog: " + why + " -> 检测到还有 " + _otherAlpa
+                        + " 个 ALPA 实例在运行，会话属于它，不抢占", LogLevel.Warn);
+                    _traceError = why + "。检测到还有 " + _otherAlpa + " 个 ALPA 实例在运行 —— "
+                        + "内核会话全机只能有一个，现在是它在用（所以本窗口没有数据）。关掉多余实例后我会自动恢复。";
+                }
+                return;
+            }
 
             if (_traceRestarts >= MaxAutoRestarts)
             {
