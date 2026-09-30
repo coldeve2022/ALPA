@@ -688,13 +688,53 @@ namespace ALP2
                     string exportReport = "导出 " + (csvLines - 1) + " 条 / 归档 " + archive + " 条（UI 窗口 "
                         + Engine.UiSpikeWindow + "）→ " + ((csvLines - 1 == archive) ? "通过" : "失败");
 
+                    // ---- 时间线：长历史 + 拖动/缩放 + 两种导出 ----
+                    TimelineChart tc = new TimelineChart();
+                    Random rr = new Random(20260930);
+                    DateTime tt0 = DateTime.Now.AddSeconds(-3000);
+                    for (int i = 0; i < 3000; i++)
+                    {
+                        double mx = 40 + rr.NextDouble() * 120;
+                        if (i % 137 == 0) mx = 1200 + rr.NextDouble() * 4000;   // 偶发尖峰
+                        tc.PushAt(tt0.AddSeconds(i), mx, 20 + rr.NextDouble() * 30, 15 + rr.NextDouble() * 60, mx >= 500 ? 1 : 0);
+                    }
+                    int hist = tc.History.Count;
+                    tc.Pan(500);
+                    int off1 = tc.Offset;
+                    tc.Pan(-99999);
+                    int off2 = tc.Offset;
+                    tc.Pan(999999);
+                    int off3 = tc.Offset;
+                    int offMax = Math.Max(0, hist - tc.ViewCount);
+                    int view0 = tc.ViewCount;
+                    tc.Zoom(1);
+                    int viewIn = tc.ViewCount;
+                    tc.Zoom(-1); tc.Zoom(-1);
+                    int viewOut = tc.ViewCount;
+                    tc.BackToLive();
+
+                    string csv2 = ChartExport.ExportCsv(dir, tc.History);
+                    string html2 = ChartExport.ExportHtml(dir, tc.History, tc.WarnUs, tc.CritUs, tc.ViewCount, 0);
+                    int csv2Lines = 0;
+                    using (System.IO.StreamReader sr2 = new System.IO.StreamReader(csv2))
+                        while (sr2.ReadLine() != null) csv2Lines++;
+                    long htmlSize = new System.IO.FileInfo(html2).Length;
+                    string htmlHead = System.IO.File.ReadAllText(html2, System.Text.Encoding.UTF8);
+                    bool htmlOk = htmlHead.Contains("<svg") && htmlHead.Contains("DPC 峰值") && htmlHead.Contains("最坏的 20 秒");
+                    bool tlOk = hist == 3000 && off1 == 500 && off2 == 0 && off3 == offMax
+                        && viewIn < view0 && viewOut > viewIn && csv2Lines == 3001 && htmlOk && htmlSize > 20000;
+                    string timelineReport = "历史 " + hist + " 条(视口 " + view0 + ") · 拖动 offset " + off1 + "/" + off2 + "/" + off3
+                        + "(上限 " + offMax + ") · 缩放 " + view0 + "→" + viewIn + "→" + viewOut
+                        + " · CSV " + csv2Lines + " 行 · HTML " + (htmlSize / 1024) + " KB → " + (tlOk ? "通过" : "失败");
+
                     string report = "csv      = " + csv + Environment.NewLine
                         + "report   = " + rep + Environment.NewLine
                         + "spikes   = " + eng.Spikes.Count + Environment.NewLine
                         + "analysis = " + (pr == null ? "<null 未发现周期>" : pr.Describe()) + Environment.NewLine
                         + "scroll   = " + scrollReport + Environment.NewLine
                         + "export   = " + exportReport + Environment.NewLine
-                        + "chart    = " + eng.SelfTestPerSecond() + Environment.NewLine;
+                        + "chart    = " + eng.SelfTestPerSecond() + Environment.NewLine
+                        + "timeline = " + timelineReport + Environment.NewLine;
                     System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "selftest.txt"), report, System.Text.Encoding.UTF8);
                 }
                 catch (Exception ex)

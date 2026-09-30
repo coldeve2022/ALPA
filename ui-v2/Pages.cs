@@ -415,6 +415,9 @@ namespace ALP2
     {
         private readonly StatCard[] _stat = new StatCard[5];
         private readonly Card _cardChart = new Card();
+        private readonly FlatButton _btnChartLive = new FlatButton();
+        private readonly FlatButton _btnChartCsv = new FlatButton();
+        private readonly FlatButton _btnChartHtml = new FlatButton();
         private readonly Card _cardTop = new Card();
         private readonly Card _cardSpike = new Card();
         private readonly Card[] _cardBot = new Card[4];
@@ -436,10 +439,29 @@ namespace ALP2
             }
 
             _cardChart.Title = "DPC / ISR 延迟时间线";
-            _cardChart.Subtitle = "每秒取该秒内的最大与平均延迟；红点 = 超过危险线";
+            _cardChart.Subtitle = "每秒取该秒内的最大与平均；拖动看历史 · 滚轮缩放 · 双击回到最新";
             _cardChart.TitleIcon = Icon.Pulse;
             _cardChart.Controls.Add(_chart);
             Controls.Add(_cardChart);
+
+            // 图表卡片头部的三个小按钮
+            _btnChartLive.Text2 = "最新";
+            _btnChartLive.Font = Theme.F(8.2f, FontStyle.Regular);
+            _btnChartLive.Kind = BtnKind.Ghost;
+            _btnChartLive.Click += delegate { _chart.BackToLive(); };
+            _cardChart.Controls.Add(_btnChartLive);
+
+            _btnChartCsv.Text2 = "导出数据";
+            _btnChartCsv.Font = Theme.F(8.2f, FontStyle.Regular);
+            _btnChartCsv.Ico = Icon.None;
+            _btnChartCsv.Click += delegate { ExportChart(false); };
+            _cardChart.Controls.Add(_btnChartCsv);
+
+            _btnChartHtml.Text2 = "导出图表";
+            _btnChartHtml.Font = Theme.F(8.2f, FontStyle.Regular);
+            _btnChartHtml.Ico = Icon.None;
+            _btnChartHtml.Click += delegate { ExportChart(true); };
+            _cardChart.Controls.Add(_btnChartHtml);
 
             _cardSpike.Title = "最近尖峰";
             _cardSpike.Subtitle = "超过阈值的事件，最新在最上";
@@ -500,6 +522,14 @@ namespace ALP2
                 _cardBot[i].SetBounds(x0 + i * (bw + Gap), y, bw, bottomH);
 
             LayoutCardInner();
+
+            // 图表卡片头部按钮：右对齐摆放（卡片子控件用卡片自身坐标系）
+            int bh = Theme.Px(22), by = Theme.Px(8), bg = Theme.Px(6);
+            int wLive = Theme.Px(50), wCsv = Theme.Px(76), wHtml = Theme.Px(76);
+            int bx = _cardChart.Width - Theme.Px(12);
+            _btnChartHtml.SetBounds(bx - wHtml, by, wHtml, bh);
+            _btnChartCsv.SetBounds(_btnChartHtml.Left - wCsv - bg, by, wCsv, bh);
+            _btnChartLive.SetBounds(_btnChartCsv.Left - wLive - bg, by, wLive, bh);
         }
 
         private void LayoutCardInner()
@@ -560,6 +590,45 @@ namespace ALP2
 
             BuildTop(s);
             BuildMini(s);
+        }
+
+        /// <summary>
+        /// 导出时间线。两种都是"真文件"而不是截图：
+        /// CSV 是逐秒明细（拿去自己画图/统计），HTML 是按数据重绘的矢量图（可缩放、可插文档）。
+        /// </summary>
+        private void ExportChart(bool html)
+        {
+            try
+            {
+                List<TimelineChart.Sample> hist = _chart.History;
+                if (hist.Count == 0)
+                {
+                    MessageBox.Show(this, "还没有采集到样本。时间线需要运行一段时间；\n若一直为空，请确认是以管理员身份运行（内核追踪需要权限）。",
+                        "暂无可导出的数据", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+                string f = html
+                    ? ChartExport.ExportHtml(Engine.AppDir, hist, _chart.WarnUs, _chart.CritUs, _chart.ViewCount, _chart.Offset)
+                    : ChartExport.ExportCsv(Engine.AppDir, hist);
+                Eng.Write("chart exported: " + f, LogLevel.Ok);
+                MessageBox.Show(this, (html
+                        ? "已导出矢量图表（HTML + 内联 SVG，浏览器打开，可缩放、可插入文档，非截图）：\n"
+                        : "已导出逐秒数据 CSV（可直接在 Excel/WPS 里画图）：\n")
+                    + f + "\n\n共 " + hist.Count + " 个样本（每秒一条）。",
+                    "导出成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "导出失败：" + ex.Message, "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        /// <summary>滚轮只发给有焦点的控件，所以悬停在图上时由页面转发给它（缩放）。</summary>
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            if (_chart.Bounds.Contains(_chart.PointToClient(Cursor.Position))) _chart.Zoom(e.Delta > 0 ? 1 : -1);
+            else if (_feed.Bounds.Contains(PointToClient(Cursor.Position))) _feed.Wheel(e.Delta);
+            base.OnMouseWheel(e);
         }
 
         private void BuildTop(Snapshot s)

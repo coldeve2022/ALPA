@@ -22,13 +22,83 @@ namespace ALP2
             public int Spikes;
         }
 
-        public int Capacity = 120;          // 保留最近 N 秒
+        /// <summary>历史保留量：这不再是"可见窗口"，而是完整历史（约 24 小时 @1Hz）。</summary>
+        public int Capacity = 100000;
         public double WarnUs = 500;         // DPC 警戒线
         public double CritUs = 1000;        // DPC 危险线
         public bool ShowIsr = true;
 
+        public const int MinView = 15;      // 最少看 15 秒
+        public const int MaxView = 43200;   // 最多看 12 小时
+
         private readonly List<Sample> _pts = new List<Sample>();
         private int _hoverIdx = -1;
+
+        // ---- 视口：能拖动看历史，而不是只剩最近一百多秒 ----
+        private int _view = 120;            // 可见样本数（窗口宽度）
+        private int _offset;                // 视口右端距"最新"多少条；0 = 跟随最新
+        private bool _drag;
+        private int _dragX, _dragOffset;
+
+        public int ViewCount { get { return _view; } }
+        public int Offset { get { return _offset; } }
+        public bool LiveMode { get { return _offset == 0; } }
+
+        /// <summary>回到"跟随最新"。</summary>
+        public void BackToLive()
+        {
+            _offset = 0;
+            _hoverIdx = -1;
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        /// <summary>缩放（正数放大时间轴=看得更少，负数缩小=看得更多）。</summary>
+        public void Zoom(int dir)
+        {
+            int nv = (int)Math.Round(_view * (dir > 0 ? 0.7 : 1.4));
+            if (nv < MinView) nv = MinView;
+            if (nv > MaxView) nv = MaxView;
+            if (nv == _view) return;
+            _view = nv;
+            ClampView();
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        /// <summary>视口平移（正数往更早看）。</summary>
+        public void Pan(int samples)
+        {
+            _offset += samples;
+            ClampView();
+            if (!IsDisposed && IsHandleCreated) Invalidate();
+        }
+
+        private void ClampView()
+        {
+            int n;
+            lock (_pts) n = _pts.Count;
+            if (_view < MinView) _view = MinView;
+            if (_view > MaxView) _view = MaxView;
+            int maxOff = Math.Max(0, n - _view);
+            if (_offset > maxOff) _offset = maxOff;
+            if (_offset < 0) _offset = 0;
+        }
+
+        /// <summary>取当前视口对应的样本切片。</summary>
+        private Sample[] Slice(out int start)
+        {
+            lock (_pts)
+            {
+                int n = _pts.Count;
+                int cnt = Math.Min(_view, n);
+                start = Math.Max(0, n - cnt - _offset);
+                cnt = Math.Min(cnt, n - start);
+                if (cnt <= 0) { start = 0; return new Sample[0]; }
+                return _pts.GetRange(start, cnt).ToArray();
+            }
+        }
+
+        /// <summary>完整历史副本（导出用）。</summary>
+        public List<Sample> History { get { lock (_pts) return new List<Sample>(_pts); } }
 
         public TimelineChart()
         {
@@ -38,17 +108,27 @@ namespace ALP2
 
         public void Push(double maxDpc, double avgDpc, double maxIsr, int spikes)
         {
+            PushAt(DateTime.Now, maxDpc, avgDpc, maxIsr, spikes);
+        }
+
+        /// <summary>按指定时刻追加（自检注入历史样本用；真实采样走 DateTime.Now）。</summary>
+        public void PushAt(DateTime t, double maxDpc, double avgDpc, double maxIsr, int spikes)
+        {
             lock (_pts)
             {
                 _pts.Add(new Sample
                 {
-                    T = DateTime.Now,
+                    T = t,
                     MaxDpc = maxDpc,
                     AvgDpc = avgDpc,
                     MaxIsr = maxIsr,
                     Spikes = spikes
                 });
                 while (_pts.Count > Capacity) _pts.RemoveAt(0);
+                // 用户正在看历史时，让"看到的那段时间"原地不动：
+                // 新样本追加在末尾，所以 offset 要同步 +1，否则画面会每秒往前滑一格。
+                if (_offset > 0) _offset++;
+                ClampView();
             }
             if (!IsDisposed && IsHandleCreated) Invalidate();
         }
@@ -56,6 +136,7 @@ namespace ALP2
         public void Clear()
         {
             lock (_pts) _pts.Clear();
+            _offset = 0; _hoverIdx = -1;
             if (!IsDisposed && IsHandleCreated) Invalidate();
         }
 
@@ -64,18 +145,66 @@ namespace ALP2
         private string _empty = "等待内核追踪数据…（需要以管理员身份运行）";
         public string EmptyText { get { return _empty; } set { _empty = value; } }
 
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                _drag = true;
+                _dragX = e.X;
+                _dragOffset = _offset;
+                Cursor = Cursors.SizeWE;
+            }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            _drag = false;
+            Cursor = Cursors.Default;
+            base.OnMouseUp(e);
+        }
+
+        protected override void OnDoubleClick(EventArgs e)
+        {
+            BackToLive();      // 双击 = 回到最新
+            base.OnDoubleClick(e);
+        }
+
         protected override void OnMouseMove(MouseEventArgs e)
         {
-            Sample[] arr;
-            lock (_pts) arr = _pts.ToArray();
-            if (arr.Length == 0) { base.OnMouseMove(e); return; }
             Rectangle plot = PlotRect();
             if (plot.Width <= 0) { base.OnMouseMove(e); return; }
-            int gap = Math.Max(1, plot.Width / Math.Max(1, arr.Length - 1));
-            int idx = (int)Math.Round((e.X - plot.X) / (double)gap);
+            int start;
+            Sample[] arr = Slice(out start);
+
+            if (_drag && arr.Length > 0)
+            {
+                // 向右拖 = 看更早的数据（和地图/图表的一致习惯）
+                int gap = Math.Max(1, plot.Width / Math.Max(1, _view - 1));
+                int d = (int)Math.Round((e.X - _dragX) / (double)gap);
+                if (_dragOffset + d != _offset)
+                {
+                    _offset = _dragOffset + d;
+                    ClampView();
+                }
+                _hoverIdx = -1;
+                Invalidate();
+                base.OnMouseMove(e);
+                return;
+            }
+
+            if (arr.Length == 0) { base.OnMouseMove(e); return; }
+            int gapPx = Math.Max(1, plot.Width / Math.Max(1, _view - 1));
+            int idx = (int)Math.Round((e.X - plot.X) / (double)gapPx);
             idx = Math.Min(arr.Length - 1, Math.Max(0, idx));
             if (idx != _hoverIdx) { _hoverIdx = idx; Invalidate(); }
             base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            Zoom(e.Delta > 0 ? 1 : -1);
+            base.OnMouseWheel(e);
         }
 
         protected override void OnMouseLeave(EventArgs e)
@@ -98,10 +227,10 @@ namespace ALP2
             g.Clear(p.Surface);
             Rectangle plot = PlotRect();
 
-            Sample[] arr;
-            lock (_pts) arr = _pts.ToArray();
+            int viewStart;
+            Sample[] arr = Slice(out viewStart);
 
-            // ---- 纵轴刻度 ----
+            // ---- 纵轴刻度（按当前视口自动缩放，这样拖到哪一段就看哪一段的形态）----
             double dataMax = 0;
             for (int i = 0; i < arr.Length; i++)
             {
@@ -133,6 +262,15 @@ namespace ALP2
             lx = Legend(g, lx, Theme.Px(4), p.Info, "DPC 均值");
             if (ShowIsr) lx = Legend(g, lx, Theme.Px(4), p.Warn, "ISR 峰值");
 
+            // 暂停跟随时给出明确提示与操作方式（不然用户不知道被"冻住"了）
+            if (!LiveMode)
+            {
+                Font fh = Theme.F(7.8f, FontStyle.Regular);
+                Draw.Text(g, "已暂停跟随 · 拖动左右移动 · 滚轮缩放 · 双击回到最新", fh, p.Warn,
+                    new Rectangle(plot.X, Theme.Px(3), plot.Width, fh.Height + Theme.Px(3)),
+                    TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
+            }
+
             if (arr.Length < 2)
             {
                 Font fe = Theme.F(9f, FontStyle.Regular);
@@ -143,7 +281,7 @@ namespace ALP2
 
             // ---- 数据折线 ----
             int n = arr.Length;
-            float gapPx = plot.Width / (float)(Capacity - 1);
+            float gapPx = plot.Width / (float)Math.Max(2, _view - 1);
             float startX = plot.Right - gapPx * (n - 1);
 
             PointF[] maxPts = new PointF[n];
@@ -217,7 +355,9 @@ namespace ALP2
                 string l1 = "DPC 该秒最大 " + Fmt.Us(arr[_hoverIdx].MaxDpc) + " µs";
                 string l2 = "DPC 该秒均值 " + Fmt.Us(arr[_hoverIdx].AvgDpc) + " µs";
                 string l3 = "ISR 该秒最大 " + Fmt.Us(arr[_hoverIdx].MaxIsr) + " µs";
-                string l4 = Fmt.Time(arr[_hoverIdx].T) + (arr[_hoverIdx].Spikes > 0 ? "  尖峰×" + arr[_hoverIdx].Spikes : "");
+                string ts = arr[_hoverIdx].T.Date == DateTime.Today
+                    ? arr[_hoverIdx].T.ToString("HH:mm:ss") : arr[_hoverIdx].T.ToString("MM-dd HH:mm:ss");
+                string l4 = ts + (arr[_hoverIdx].Spikes > 0 ? "  尖峰×" + arr[_hoverIdx].Spikes : "");
                 Font ft = Theme.F(8.2f, FontStyle.Regular);
                 int tw = Math.Max(Draw.Measure(l1, ft).Width, Math.Max(Draw.Measure(l2, ft).Width, Draw.Measure(l4, ft).Width)) + Theme.Px(20);
                 int th = ft.Height * 4 + Theme.Px(14);
@@ -237,12 +377,25 @@ namespace ALP2
 
             // ---- 时间轴说明 ----
             Font fx = Theme.F(7.6f, FontStyle.Regular);
-            Draw.Text(g, "最近 " + (Capacity) + " 秒", fx, p.TextMuted,
-                new Rectangle(plot.X, plot.Bottom + Theme.Px(4), plot.Width, fx.Height + Theme.Px(4)),
+            Rectangle labRow = new Rectangle(plot.X, plot.Bottom + Theme.Px(4), plot.Width, fx.Height + Theme.Px(4));
+            string leftLbl = n > 0
+                ? (arr[0].T.Date == DateTime.Today ? arr[0].T.ToString("HH:mm:ss") : arr[0].T.ToString("MM-dd HH:mm"))
+                : "";
+            string rightLbl = (LiveMode ? "现在" : (n > 0
+                ? (arr[n - 1].T.Date == DateTime.Today ? arr[n - 1].T.ToString("HH:mm:ss") : arr[n - 1].T.ToString("MM-dd HH:mm"))
+                : "")) + "   ·   窗口 " + FmtWindow(_view);
+            Draw.Text(g, leftLbl, fx, p.TextMuted, labRow,
                 TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
-            Draw.Text(g, "现在", fx, p.TextMuted,
-                new Rectangle(plot.X, plot.Bottom + Theme.Px(4), plot.Width, fx.Height + Theme.Px(4)),
+            Draw.Text(g, rightLbl, fx, p.TextMuted, labRow,
                 TextFormatFlags.Right | TextFormatFlags.Top | TextFormatFlags.NoPrefix);
+        }
+
+        /// <summary>把窗口秒数写成人类可读的量级。</summary>
+        private static string FmtWindow(int sec)
+        {
+            if (sec < 90) return sec + " 秒";
+            if (sec < 5400) return (sec / 60.0).ToString("0.#") + " 分钟";
+            return (sec / 3600.0).ToString("0.##") + " 小时";
         }
 
         private static float YOf(double v, Rectangle plot, double top)

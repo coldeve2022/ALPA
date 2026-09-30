@@ -344,7 +344,9 @@ namespace ALP2
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Cur.Bg);
+            // 父控件若是"透明"（本程序里就是 Card），用 Transparent 去 Clear 会画出黑底，
+            // 所以退回到卡片底色 —— 卡片子控件上放按钮时必须走这一支。
+            g.Clear(Parent != null && Parent.BackColor != Color.Transparent ? Parent.BackColor : Theme.Cur.Surface);
             Palette p = Theme.Cur;
             Color fill, text, border;
 
